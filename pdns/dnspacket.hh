@@ -137,6 +137,9 @@ public:
     d_ednsrcode=extRCode;
   };
   uint8_t getEDNSRCode() const { return d_ednsrcode; };
+  uint32_t getHash() const { return d_hash; };
+  void setHash(uint32_t hash) { d_hash = hash; };
+
   //////// DATA !
 
   DNSName qdomain;  //!< qname of the question 4 - unsure how this is used
@@ -159,11 +162,13 @@ public:
   bool d_dnssecOk;
   bool d_havetsig;
 
-  bool getTSIGDetails(TSIGRecordContent* tr, DNSName* keyname, string* message) const;
+  bool getTSIGDetails(TSIGRecordContent* tr, DNSName* keyname, uint16_t* tsigPos=nullptr) const;
   void setTSIGDetails(const TSIGRecordContent& tr, const DNSName& keyname, const string& secret, const string& previous, bool timersonly=false);
   bool getTKEYRecord(TKEYRecordContent* tr, DNSName* keyname) const;
 
   vector<DNSZoneRecord>& getRRS() { return d_rrs; }
+  bool checkForCorrectTSIG(UeberBackend* B, DNSName* keyname, string* secret, TSIGRecordContent* trc) const;
+
   static bool s_doEDNSSubnetProcessing;
   static uint16_t s_udpTruncationThreshold; //2
 private:
@@ -186,6 +191,8 @@ private:
   // WARNING! This is really 12 bits
   uint16_t d_ednsrcode;
 
+  uint32_t d_hash{0};
+  
   bool d_compress; // 1
   bool d_tsigtimersonly;
   bool d_wantsnsid;
@@ -193,8 +200,5 @@ private:
   bool d_haveednssection;
   bool d_isQuery;
 };
-
-
-bool checkForCorrectTSIG(const DNSPacket* q, UeberBackend* B, DNSName* keyname, string* secret, TSIGRecordContent* trc);
 
 #endif

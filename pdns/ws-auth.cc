@@ -1,23 +1,24 @@
 /*
-    Copyright (C) 2002 - 2016  PowerDNS.COM BV
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License version 2
-    as published by the Free Software Foundation
-
-    Additionally, the license of this program contains a special
-    exception which allows to distribute the program in binary form when
-    it is linked against OpenSSL.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * This file is part of PowerDNS or dnsdist.
+ * Copyright -- PowerDNS.COM B.V. and its contributors
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * In addition, for the avoidance of any doubt, permission is granted to
+ * link this program with OpenSSL and to (re)distribute the binaries
+ * produced as the result of such linking.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -27,7 +28,6 @@
 #include "json.hh"
 #include "webserver.hh"
 #include "logger.hh"
-#include "packetcache.hh"
 #include "statbag.hh"
 #include "misc.hh"
 #include "arguments.hh"
@@ -43,12 +43,11 @@
 #include <iomanip>
 #include "zoneparser-tng.hh"
 #include "common_startup.hh"
-
+#include "auth-caches.hh"
 
 using json11::Json;
 
 extern StatBag S;
-extern PacketCache PC;
 
 static void patchZone(HttpRequest* req, HttpResponse* resp);
 static void storeChangedPTRs(UeberBackend& B, vector<DNSResourceRecord>& new_ptrs);
@@ -239,9 +238,9 @@ void AuthWebServer::indexfunction(HttpRequest* req, HttpResponse* resp)
     "<br>"<<endl;
 
   ret<<"Queries/second, 1, 5, 10 minute averages:  "<<std::setprecision(3)<<
-    d_queries.get1()<<", "<<
-    d_queries.get5()<<", "<<
-    d_queries.get10()<<". Max queries/second: "<<d_queries.getMax()<<
+    (int)d_queries.get1()<<", "<<
+    (int)d_queries.get5()<<", "<<
+    (int)d_queries.get10()<<". Max queries/second: "<<(int)d_queries.getMax()<<
     "<br>"<<endl;
 
   if(d_cachemisses.get10()+d_cachehits.get10()>0)
@@ -259,9 +258,9 @@ void AuthWebServer::indexfunction(HttpRequest* req, HttpResponse* resp)
       "<br>"<<endl;
 
   ret<<"Backend query load, 1, 5, 10 minute averages: "<<std::setprecision(3)<<
-    d_qcachemisses.get1()<<", "<<
-    d_qcachemisses.get5()<<", "<<
-    d_qcachemisses.get10()<<". Max queries/second: "<<d_qcachemisses.getMax()<<
+    (int)d_qcachemisses.get1()<<", "<<
+    (int)d_qcachemisses.get5()<<", "<<
+    (int)d_qcachemisses.get10()<<". Max queries/second: "<<(int)d_qcachemisses.getMax()<<
     "<br>"<<endl;
 
   ret<<"Total queries: "<<S.read("udp-queries")<<". Question/answer latency: "<<S.read("latency")/1000.0<<"ms</p><br>"<<endl;
@@ -278,7 +277,7 @@ void AuthWebServer::indexfunction(HttpRequest* req, HttpResponse* resp)
     printtable(ret,req->getvars["ring"],S.getRingTitle(req->getvars["ring"]),100);
 
   ret<<"</div></div>"<<endl;
-  ret<<"<footer class=\"row\">"<<fullVersionString()<<"<br>&copy; 2013 - 2016 <a href=\"http://www.powerdns.com/\">PowerDNS.COM BV</a>.</footer>"<<endl;
+  ret<<"<footer class=\"row\">"<<fullVersionString()<<"<br>&copy; 2013 - 2017 <a href=\"http://www.powerdns.com/\">PowerDNS.COM BV</a>.</footer>"<<endl;
   ret<<"</body></html>"<<endl;
 
   resp->body = ret.str();
@@ -302,8 +301,7 @@ static inline string makeBackendRecordContent(const QType& qtype, const string& 
   return makeRecordContent(qtype, content, true);
 }
 
-static Json::object getZoneInfo(const DomainInfo& di) {
-  DNSSECKeeper dk;
+static Json::object getZoneInfo(const DomainInfo& di, DNSSECKeeper *dk) {
   string zoneId = apiZoneNameToId(di.zone);
   return Json::object {
     // id is the canonical lookup key, which doesn't actually match the name (in some cases)
@@ -311,7 +309,7 @@ static Json::object getZoneInfo(const DomainInfo& di) {
     { "url", "/api/v1/servers/localhost/zones/" + zoneId },
     { "name", di.zone.toString() },
     { "kind", di.getKindString() },
-    { "dnssec", dk.isSecuredZone(di.zone) },
+    { "dnssec", dk->isSecuredZone(di.zone) },
     { "account", di.account },
     { "masters", di.masters },
     { "serial", (double)di.serial },
@@ -326,7 +324,8 @@ static void fillZone(const DNSName& zonename, HttpResponse* resp) {
   if(!B.getDomainInfo(zonename, di))
     throw ApiException("Could not find domain '"+zonename.toString()+"'");
 
-  Json::object doc = getZoneInfo(di);
+  DNSSECKeeper dk(&B);
+  Json::object doc = getZoneInfo(di, &dk);
   // extra stuff getZoneInfo doesn't do for us (more expensive)
   string soa_edit_api;
   di.backend->getDomainMetadataOne(zonename, "SOA-EDIT-API", soa_edit_api);
@@ -555,6 +554,9 @@ static bool isValidMetadataKind(const string& kind, bool readonly) {
     "LUA-AXFR-SCRIPT"
   };
 
+  if (kind.find("X-") == 0)
+    return true;
+
   bool found = false;
 
   for (const string& s : builtinOptions) {
@@ -770,7 +772,7 @@ static void apiZoneCryptokeysGET(DNSName zonename, int inquireKeyId, HttpRespons
  * Server Answers:
  * Case 1: the backend returns true on removal. This means the key is gone.
  *      The server returns 200 OK, no body.
- * Case 2: the backend returns false on removal. An error occoured.
+ * Case 2: the backend returns false on removal. An error occurred.
  *      The sever returns 422 Unprocessable Entity with message "Could not DELETE :cryptokey_id".
  * */
 static void apiZoneCryptokeysDELETE(DNSName zonename, int inquireKeyId, HttpRequest *req, HttpResponse *resp, DNSSECKeeper *dk) {
@@ -789,7 +791,7 @@ static void apiZoneCryptokeysDELETE(DNSName zonename, int inquireKeyId, HttpRequ
  *  "content" : "key The format used is compatible with BIND and NSD/LDNS" <string>
  *  "keytype" : "ksk|zsk" <string>
  *  "active"  : "true|false" <value>
- *  "algo" : "key generation algorithim "name|number" as default"<string> https://doc.powerdns.com/md/authoritative/dnssec/#supported-algorithms
+ *  "algo" : "key generation algorithm "name|number" as default"<string> https://doc.powerdns.com/md/authoritative/dnssec/#supported-algorithms
  *  "bits" : number of bits <int>
  *  }
  *
@@ -904,7 +906,7 @@ static void apiZoneCryptokeysPOST(DNSName zonename, HttpRequest *req, HttpRespon
  *      The server returns 400 Bad Request
  * Case 2: the backend returns true on de/activation. This means the key is de/active.
  *      The server returns 204 No Content
- * Case 3: the backend returns false on de/activation. An error occoured.
+ * Case 3: the backend returns false on de/activation. An error occurred.
  *      The sever returns 422 Unprocessable Entity with message "Could not de/activate Key: :cryptokey_id in Zone: :zone_name"
  * */
 static void apiZoneCryptokeysPUT(DNSName zonename, int inquireKeyId, HttpRequest *req, HttpResponse *resp, DNSSECKeeper *dk) {
@@ -1153,7 +1155,7 @@ static void apiServerZones(HttpRequest* req, HttpResponse* resp) {
 
   Json::array doc;
   for(const DomainInfo& di : domains) {
-    doc.push_back(getZoneInfo(di));
+    doc.push_back(getZoneInfo(di, &dk));
   }
   resp->setBody(doc);
 }
@@ -1348,7 +1350,7 @@ static void storeChangedPTRs(UeberBackend& B, vector<DNSResourceRecord>& new_ptr
     }
 
     sd.db->commitTransaction();
-    PC.purgeExact(rr.qname);
+    purgeAuthCachesExact(rr.qname);
   }
 }
 
@@ -1389,7 +1391,7 @@ static void patchZone(HttpRequest* req, HttpResponse* resp) {
       }
 
       if (changetype == "DELETE") {
-        // delete all matching qname/qtype RRs (and, implictly comments).
+        // delete all matching qname/qtype RRs (and, implicitly comments).
         if (!di.backend->replaceRRSet(di.id, qname, qtype, vector<DNSResourceRecord>())) {
           throw ApiException("Hosting backend does not support editing records.");
         }
@@ -1475,7 +1477,7 @@ static void patchZone(HttpRequest* req, HttpResponse* resp) {
   }
   di.backend->commitTransaction();
 
-  PC.purgeExact(zonename);
+  purgeAuthCachesExact(zonename);
 
   // now the PTRs
   storeChangedPTRs(B, new_ptrs);
@@ -1574,10 +1576,10 @@ void apiServerCacheFlush(HttpRequest* req, HttpResponse* resp) {
 
   DNSName canon = apiNameToDNSName(req->getvars["domain"]);
 
-  int count = PC.purgeExact(canon);
+  uint64_t count = purgeAuthCachesExact(canon);
   resp->setBody(Json::object {
-    { "count", count },
-    { "result", "Flushed cache." }
+      { "count", (int) count },
+      { "result", "Flushed cache." }
   });
 }
 

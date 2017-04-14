@@ -1,7 +1,5 @@
 #include "config.h"
-#ifdef HAVE_LUA
 #include "ext/luawrapper/include/LuaContext.hpp"
-#endif
 
 #include <fstream>
 #include <thread>
@@ -52,13 +50,37 @@ typename C::value_type::second_type constGet(const C& c, const std::string& name
   return iter->second;
 }
 
-#ifndef HAVE_LUA
-void loadRecursorLuaConfig(const std::string& fname, bool checkOnly)
+
+static void parseRPZParameters(const std::unordered_map<string,boost::variant<uint32_t, string> >& have, std::string& polName, boost::optional<DNSFilterEngine::Policy>& defpol, uint32_t& maxTTL, size_t& zoneSizeHint)
 {
-  if(!fname.empty())
-    throw PDNSException("Asked to load a Lua configuration file '"+fname+"' in binary without Lua support");
+  if(have.count("policyName")) {
+    polName = boost::get<std::string>(constGet(have, "policyName"));
+  }
+  if(have.count("defpol")) {
+    defpol=DNSFilterEngine::Policy();
+    defpol->d_kind = (DNSFilterEngine::PolicyKind)boost::get<uint32_t>(constGet(have, "defpol"));
+    defpol->d_name = std::make_shared<std::string>(polName);
+    if(defpol->d_kind == DNSFilterEngine::PolicyKind::Custom) {
+      defpol->d_custom=
+        shared_ptr<DNSRecordContent>(
+          DNSRecordContent::mastermake(QType::CNAME, 1,
+                                       boost::get<string>(constGet(have,"defcontent"))
+            )
+          );
+
+      if(have.count("defttl"))
+        defpol->d_ttl = static_cast<int32_t>(boost::get<uint32_t>(constGet(have, "defttl")));
+      else
+        defpol->d_ttl = -1; // get it from the zone
+    }
+  }
+  if(have.count("maxTTL")) {
+    maxTTL = boost::get<uint32_t>(constGet(have, "maxTTL"));
+  }
+  if(have.count("zoneSizeHint")) {
+    zoneSizeHint = static_cast<size_t>(boost::get<uint32_t>(constGet(have, "zoneSizeHint")));
+  }
 }
-#else
 
 void loadRecursorLuaConfig(const std::string& fname, bool checkOnly)
 {
@@ -68,10 +90,9 @@ void loadRecursorLuaConfig(const std::string& fname, bool checkOnly)
   if(fname.empty())
     return;
   ifstream ifs(fname);
-  if(!ifs) {
-    theL()<<"Unable to read configuration file from '"<<fname<<"': "<<strerror(errno)<<endl;
-    return;
-  }
+  if(!ifs)
+    throw PDNSException("Cannot open file '"+fname+"': "+strerror(errno));
+
   Lua.writeFunction("clearSortlist", [&lci]() { lci.sortlist.clear(); });
   
   /* we can get: "1.2.3.4"
@@ -89,115 +110,83 @@ void loadRecursorLuaConfig(const std::string& fname, bool checkOnly)
   };
   Lua.writeVariable("Policy", pmap);
 
-  Lua.writeFunction("rpzFile", [&lci](const string& filename, const boost::optional<std::unordered_map<string,boost::variant<int, string>>>& options) {
+  Lua.writeFunction("rpzFile", [&lci](const string& filename, const boost::optional<std::unordered_map<string,boost::variant<uint32_t, string>>>& options) {
       try {
-	boost::optional<DNSFilterEngine::Policy> defpol;
-	std::string polName("rpzFile");
-	if(options) {
-	  auto& have = *options;
-	  if(have.count("policyName")) {
-	    polName = boost::get<std::string>(constGet(have, "policyName"));
-	  }
-	  if(have.count("defpol")) {
-	    defpol=DNSFilterEngine::Policy();
-	    defpol->d_kind = (DNSFilterEngine::PolicyKind)boost::get<int>(constGet(have, "defpol"));
-	    defpol->d_name = std::make_shared<std::string>(polName);
-	    if(defpol->d_kind == DNSFilterEngine::PolicyKind::Custom) {
-	      defpol->d_custom=
-		shared_ptr<DNSRecordContent>(
-					     DNSRecordContent::mastermake(QType::CNAME, 1, 
-									  boost::get<string>(constGet(have,"defcontent"))
-									  )
-					     );
-	 
-	      if(have.count("defttl"))
-		defpol->d_ttl = boost::get<int>(constGet(have, "defttl"));
-	      else
-		defpol->d_ttl = -1; // get it from the zone
-	    }
-	  }
-	}
+        boost::optional<DNSFilterEngine::Policy> defpol;
+        std::string polName("rpzFile");
         const size_t zoneIdx = lci.dfe.size();
+        uint32_t maxTTL = std::numeric_limits<uint32_t>::max();
+        if(options) {
+          auto& have = *options;
+          size_t zoneSizeHint = 0;
+          parseRPZParameters(have, polName, defpol, maxTTL, zoneSizeHint);
+          if (zoneSizeHint > 0) {
+            lci.dfe.reserve(zoneIdx, zoneSizeHint);
+          }
+        }
         theL()<<Logger::Warning<<"Loading RPZ from file '"<<filename<<"'"<<endl;
         lci.dfe.setPolicyName(zoneIdx, polName);
-        loadRPZFromFile(filename, lci.dfe, defpol, zoneIdx);
+        loadRPZFromFile(filename, lci.dfe, defpol, maxTTL, zoneIdx);
         theL()<<Logger::Warning<<"Done loading RPZ from file '"<<filename<<"'"<<endl;
       }
       catch(std::exception& e) {
-	theL()<<Logger::Error<<"Unable to load RPZ zone from '"<<filename<<"': "<<e.what()<<endl;
+        theL()<<Logger::Error<<"Unable to load RPZ zone from '"<<filename<<"': "<<e.what()<<endl;
       }
     });
 
-
-  Lua.writeFunction("rpzMaster", [&lci, checkOnly](const string& master_, const string& zone_, const boost::optional<std::unordered_map<string,boost::variant<int, string>>>& options) {
+  Lua.writeFunction("rpzMaster", [&lci, checkOnly](const string& master_, const string& zone_, const boost::optional<std::unordered_map<string,boost::variant<uint32_t, string>>>& options) {
       try {
-	boost::optional<DNSFilterEngine::Policy> defpol;
+        boost::optional<DNSFilterEngine::Policy> defpol;
         TSIGTriplet tt;
-        int refresh=0;
-	std::string polName;
-	size_t maxReceivedXFRMBytes = 0;
+        uint32_t refresh=0;
+        std::string polName(zone_);
+        size_t maxReceivedXFRMBytes = 0;
+        uint32_t maxTTL = std::numeric_limits<uint32_t>::max();
         ComboAddress localAddress;
-	if(options) {
-	  auto& have = *options;
-          polName = zone_;
-	  if(have.count("policyName"))
-	    polName = boost::get<std::string>(constGet(have, "policyName"));
-	  if(have.count("defpol")) {
-	    //	    cout<<"Set a default policy"<<endl;
-	    defpol=DNSFilterEngine::Policy();
-	    defpol->d_kind = (DNSFilterEngine::PolicyKind)boost::get<int>(constGet(have, "defpol"));
-	    defpol->d_name = std::make_shared<std::string>(polName);
-	    if(defpol->d_kind == DNSFilterEngine::PolicyKind::Custom) {
-	      //	      cout<<"Setting a custom field even!"<<endl;
-	      defpol->d_custom=
-		shared_ptr<DNSRecordContent>(
-					     DNSRecordContent::mastermake(QType::CNAME, 1, 
-									  boost::get<string>(constGet(have,"defcontent"))
-									  )
-					     );
-	      if(have.count("defttl"))
-		defpol->d_ttl = boost::get<int>(constGet(have, "defttl"));
-	      else
-		defpol->d_ttl = -1; // get it from the zone
-	    }
-	  }
-	  if(have.count("tsigname")) {
+        const size_t zoneIdx = lci.dfe.size();
+        if(options) {
+          auto& have = *options;
+          size_t zoneSizeHint = 0;
+          parseRPZParameters(have, polName, defpol, maxTTL, zoneSizeHint);
+          if (zoneSizeHint > 0) {
+            lci.dfe.reserve(zoneIdx, zoneSizeHint);
+          }
+          if(have.count("tsigname")) {
             tt.name=DNSName(toLower(boost::get<string>(constGet(have, "tsigname"))));
             tt.algo=DNSName(toLower(boost::get<string>(constGet(have, "tsigalgo"))));
             if(B64Decode(boost::get<string>(constGet(have, "tsigsecret")), tt.secret))
               throw std::runtime_error("TSIG secret is not valid Base-64 encoded");
           }
           if(have.count("refresh")) {
-            refresh = boost::get<int>(constGet(have,"refresh"));
+            refresh = boost::get<uint32_t>(constGet(have,"refresh"));
           }
           if(have.count("maxReceivedMBytes")) {
-            maxReceivedXFRMBytes = static_cast<size_t>(boost::get<int>(constGet(have,"maxReceivedMBytes")));
+            maxReceivedXFRMBytes = static_cast<size_t>(boost::get<uint32_t>(constGet(have,"maxReceivedMBytes")));
           }
           if(have.count("localAddress")) {
             localAddress = ComboAddress(boost::get<string>(constGet(have,"localAddress")));
           }
-	}
-	ComboAddress master(master_, 53);
+        }
+        ComboAddress master(master_, 53);
         if (localAddress != ComboAddress() && localAddress.sin4.sin_family != master.sin4.sin_family)
           // We were passed a localAddress, check if its AF matches the master's
           throw PDNSException("Master address("+master.toString()+") is not of the same Address Family as the local address ("+localAddress.toString()+").");
-	DNSName zone(zone_);
-        const size_t zoneIdx = lci.dfe.size();
+        DNSName zone(zone_);
         lci.dfe.setPolicyName(zoneIdx, polName);
 
         if (!checkOnly) {
-          auto sr=loadRPZFromServer(master, zone, lci.dfe, defpol, zoneIdx, tt, maxReceivedXFRMBytes * 1024 * 1024, localAddress);
+          auto sr=loadRPZFromServer(master, zone, lci.dfe, defpol, maxTTL, zoneIdx, tt, maxReceivedXFRMBytes * 1024 * 1024, localAddress);
           if(refresh)
             sr->d_st.refresh=refresh;
-          std::thread t(RPZIXFRTracker, master, zone, defpol, zoneIdx, tt, sr, maxReceivedXFRMBytes * 1024 * 1024, localAddress);
+          std::thread t(RPZIXFRTracker, master, zone, defpol, maxTTL, zoneIdx, tt, sr, maxReceivedXFRMBytes * 1024 * 1024, localAddress);
           t.detach();
         }
       }
       catch(std::exception& e) {
-	theL()<<Logger::Error<<"Unable to load RPZ zone '"<<zone_<<"' from '"<<master_<<"': "<<e.what()<<endl;
+        theL()<<Logger::Error<<"Unable to load RPZ zone '"<<zone_<<"' from '"<<master_<<"': "<<e.what()<<endl;
       }
       catch(PDNSException& e) {
-	theL()<<Logger::Error<<"Unable to load RPZ zone '"<<zone_<<"' from '"<<master_<<"': "<<e.reason<<endl;
+        theL()<<Logger::Error<<"Unable to load RPZ zone '"<<zone_<<"' from '"<<master_<<"': "<<e.reason<<endl;
       }
 
     });
@@ -343,4 +332,3 @@ void loadRecursorLuaConfig(const std::string& fname, bool checkOnly)
 
 }
 
-#endif

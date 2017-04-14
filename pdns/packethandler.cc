@@ -61,7 +61,7 @@ PacketHandler::PacketHandler():B(s_programname), d_dk(&B)
 {
   ++s_count;
   d_doDNAME=::arg().mustDo("dname-processing");
-  d_doRecursion= ::arg().mustDo("recursor");
+  d_doExpandALIAS = ::arg().mustDo("expand-alias");
   d_logDNSDetails= ::arg().mustDo("log-dns-details");
   d_doIPv6AdditionalProcessing = ::arg().mustDo("do-ipv6-additional-processing");
   string fname= ::arg()["lua-prequery-script"];
@@ -954,11 +954,8 @@ DNSPacket *PacketHandler::question(DNSPacket *p)
     return ret;
   }
 
-  bool shouldRecurse=false;
-  ret=questionOrRecurse(p, &shouldRecurse);
-  if(shouldRecurse) {
-    DP->sendPacket(p);
-  }
+  ret=doQuestion(p);
+
   if(LPE) {
     policyres = LPE->police(p, ret);
     if(policyres == PolicyDecision::DROP) {
@@ -1118,9 +1115,8 @@ bool PacketHandler::tryWildcard(DNSPacket *p, DNSPacket*r, SOAData& sd, DNSName 
 }
 
 //! Called by the Distributor to ask a question. Returns 0 in case of an error
-DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
+DNSPacket *PacketHandler::doQuestion(DNSPacket *p)
 {
-  *shouldRecurse=false;
   DNSZoneRecord rr;
   SOAData sd;
 
@@ -1163,7 +1159,7 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
     DNSName keyname;
     string secret;
     TSIGRecordContent trc;
-    if(!checkForCorrectTSIG(p, &B, &keyname, &secret, &trc)) {
+    if(!p->checkForCorrectTSIG(&B, &keyname, &secret, &trc)) {
       r=p->replyPacket();  // generate an empty reply packet
       if(d_logDNSDetails)
         L<<Logger::Error<<"Received a TSIG signed message with a non-validating key"<<endl;
@@ -1238,8 +1234,6 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
 
     // L<<Logger::Warning<<"Query for '"<<p->qdomain<<"' "<<p->qtype.getName()<<" from "<<p->getRemote()<< " (tcp="<<p->d_tcp<<")"<<endl;
     
-    r->d.ra = (p->d.rd && d_doRecursion && DP->recurseFor(p));  // make sure we set ra if rd was set, and we'll do it
-
     if(p->qtype.getCode()==QType::IXFR) {
       r->setRcode(RCode::NotImp);
       return r;
@@ -1284,13 +1278,6 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
     
     if(!B.getAuth(p, &sd, target)) {
       DLOG(L<<Logger::Error<<"We have no authority over zone '"<<target<<"'"<<endl);
-      if(r->d.ra) {
-        DLOG(L<<Logger::Error<<"Recursion is available for this remote, doing that"<<endl);
-        *shouldRecurse=true;
-        delete r;
-        return 0;
-      }
-      
       if(!retargetcount) {
         r->setA(false); // drop AA if we never had a SOA in the first place
         r->setRcode(RCode::Refused); // send REFUSED - but only on empty 'no idea'
@@ -1381,6 +1368,10 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
         weRedirected=1;
 
       if(DP && rr.dr.d_type == QType::ALIAS && (p->qtype.getCode() == QType::A || p->qtype.getCode() == QType::AAAA || p->qtype.getCode() == QType::ANY)) {
+        if (!d_doExpandALIAS) {
+          L<<Logger::Info<<"ALIAS record found for "<<target<<", but ALIAS expansion is disabled."<<endl;
+          continue;
+        }
         haveAlias=getRR<ALIASRecordContent>(rr.dr)->d_content;
       }
 
@@ -1510,7 +1501,7 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
     
     for(const auto& rr: r->getRRS()) {
       if(rr.scopeMask) {
-        noCache=1;
+        noCache=true;
         break;
       }
     }
@@ -1518,8 +1509,8 @@ DNSPacket *PacketHandler::questionOrRecurse(DNSPacket *p, bool *shouldRecurse)
       addRRSigs(d_dk, B, authSet, r->getRRS());
       
     r->wrapup(); // needed for inserting in cache
-    if(!noCache)
-      PC.insert(p, r, false, r->getMinTTL()); // in the packet cache
+    if(!noCache && p->couldBeCached())
+      PC.insert(p, r, r->getMinTTL()); // in the packet cache
   }
   catch(DBException &e) {
     L<<Logger::Error<<"Backend reported condition which prevented lookup ("+e.reason+") sending out servfail"<<endl;

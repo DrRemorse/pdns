@@ -25,61 +25,12 @@
 #include "dnsparser.hh"
 #include "syncres.hh"
 #include "namespaces.hh"
-#include "rec_channel.hh" 
+#include "rec_channel.hh"
+#include "ednsoptions.hh"
 #include "ednssubnet.hh"
 #include "filterpo.hh"
+#include "rec-snmp.hh"
 #include <unordered_set>
-
-#if !defined(HAVE_LUA)
-RecursorLua4::RecursorLua4(const std::string &fname)
-{
-  throw std::runtime_error("Attempt to load a Lua script in a PowerDNS binary without Lua support");
-}
-
-bool RecursorLua4::nxdomain(DNSQuestion& dq, int& res)
-{
-  return false;
-}
-
-bool RecursorLua4::nodata(DNSQuestion& dq, int& res)
-{
-  return false;
-}
-
-bool RecursorLua4::postresolve(DNSQuestion& dq, int& res)
-{
-  return false;
-}
-
-bool RecursorLua4::prerpz(DNSQuestion& dq, int& ret)
-{
-  return false;
-}
-
-bool RecursorLua4::preresolve(DNSQuestion& dq, int& res)
-{
-  return false;
-}
-
-bool RecursorLua4::preoutquery(const ComboAddress& ns, const ComboAddress& requestor, const DNSName& query, const QType& qtype, bool isTcp, vector<DNSRecord>& res, int& ret)
-{
-  return false;
-}
-
-bool RecursorLua4::ipfilter(const ComboAddress& remote, const ComboAddress& local, const struct dnsheader& dh)
-{
-  return false;
-}
-
-int RecursorLua4::gettag(const ComboAddress& remote, const Netmask& ednssubnet, const ComboAddress& local, const DNSName& qname, uint16_t qtype, std::vector<std::string>* policyTags)
-{
-  return 0;
-}
-
-
-#else
-#undef L
-#include "ext/luawrapper/include/LuaContext.hpp"
 
 static int followCNAMERecords(vector<DNSRecord>& ret, const QType& qtype)
 {
@@ -208,7 +159,7 @@ boost::optional<Netmask>  RecursorLua4::DNSQuestion::getEDNSSubnet() const
 
   if(ednsOptions) {
     for(const auto& o : *ednsOptions) {
-      if(o.first==8) {
+      if(o.first==EDNSOptionCode::ECS) {
         EDNSSubnetOpts eso;
         if(getEDNSSubnetOptsFromString(o.second, &eso))
           return eso.source;
@@ -433,7 +384,10 @@ RecursorLua4::RecursorLua4(const std::string& fname)
   d_lw->registerMember("type", &DNSRecord::d_type);
   d_lw->registerMember("ttl", &DNSRecord::d_ttl);
   d_lw->registerMember("place", &DNSRecord::d_place);
-  
+
+  d_lw->registerMember("size", &EDNSOptionView::size);
+  d_lw->registerFunction<std::string(EDNSOptionView::*)()>("getContent", [](const EDNSOptionView& option) { return std::string(option.content, option.size); });
+
   d_lw->registerFunction<string(DNSRecord::*)()>("getContent", [](const DNSRecord& dr) { return dr.d_content->getZoneRepresentation(); });
   d_lw->registerFunction<boost::optional<ComboAddress>(DNSRecord::*)()>("getCA", [](const DNSRecord& dr) { 
       boost::optional<ComboAddress> ret;
@@ -568,6 +522,11 @@ RecursorLua4::RecursorLua4(const std::string& fname)
       return getRecursorThreadId();
     });
 
+  d_lw->writeFunction("sendCustomSNMPTrap", [](const std::string& str) {
+      if (g_snmpAgent) {
+        g_snmpAgent->sendCustomTrap(str);
+      }
+    });
   
   ifstream ifs(fname);
   if(!ifs) {
@@ -615,7 +574,7 @@ bool RecursorLua4::preoutquery(const ComboAddress& ns, const ComboAddress& reque
 {
   bool variableAnswer = false;
   bool wantsRPZ = false;
-  RecursorLua4::DNSQuestion dq(requestor, ns, query, qtype.getCode(), isTcp, variableAnswer, wantsRPZ);
+  RecursorLua4::DNSQuestion dq(ns, requestor, query, qtype.getCode(), isTcp, variableAnswer, wantsRPZ);
   dq.currentRecords = &res;
 
   return genhook(d_preoutquery, dq, ret);
@@ -628,10 +587,10 @@ bool RecursorLua4::ipfilter(const ComboAddress& remote, const ComboAddress& loca
   return false; // don't block
 }
 
-int RecursorLua4::gettag(const ComboAddress& remote, const Netmask& ednssubnet, const ComboAddress& local, const DNSName& qname, uint16_t qtype, std::vector<std::string>* policyTags)
+unsigned int RecursorLua4::gettag(const ComboAddress& remote, const Netmask& ednssubnet, const ComboAddress& local, const DNSName& qname, uint16_t qtype, std::vector<std::string>* policyTags, LuaContext::LuaObject& data, const std::map<uint16_t, EDNSOptionView>& ednsOptions)
 {
   if(d_gettag) {
-    auto ret = d_gettag(remote, ednssubnet, local, qname, qtype);
+    auto ret = d_gettag(remote, ednssubnet, local, qname, qtype, ednsOptions);
 
     if (policyTags) {
       const auto& tags = std::get<1>(ret);
@@ -640,6 +599,10 @@ int RecursorLua4::gettag(const ComboAddress& remote, const Netmask& ednssubnet, 
           policyTags->push_back(tag.second);
         }
       }
+    }
+    const auto dataret = std::get<2>(ret);
+    if (dataret) {
+      data = *dataret;
     }
     return std::get<0>(ret);
   }
@@ -704,5 +667,4 @@ loop:;
   return handled;
 }
 
-#endif
 RecursorLua4::~RecursorLua4(){}

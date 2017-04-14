@@ -157,7 +157,7 @@ public:
 private:
   uint16_t d_startrecordpos; // needed for getBlob later on
   uint16_t d_recordlen;      // ditto
-  uint16_t not_used; // Alighns the whole class on 8-byte boundries
+  uint16_t not_used; // Aligns the whole class on 8-byte boundries
   const vector<uint8_t>& d_content;
 };
 
@@ -361,7 +361,7 @@ public:
 
   typedef vector<pair<DNSRecord, uint16_t > > answers_t;
   
-  //! All answers contained in this packet
+  //! All answers contained in this packet (everything *but* the question section)
   answers_t d_answers;
 
   shared_ptr<PacketReader> getPacketReader(uint16_t offset)

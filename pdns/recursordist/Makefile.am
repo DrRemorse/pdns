@@ -1,6 +1,6 @@
 JSON11_LIBS = $(top_srcdir)/ext/json11/libjson11.la
 
-AM_CPPFLAGS = $(LUA_CFLAGS) $(YAHTTP_CFLAGS) $(BOOST_CPPFLAGS) $(BOTAN110_CFLAGS) $(SANITIZER_FLAGS) -O3 -Wall -pthread -DSYSCONFDIR=\"${sysconfdir}\" $(SYSTEMD_CFLAGS)
+AM_CPPFLAGS = $(LUA_CFLAGS) $(YAHTTP_CFLAGS) $(BOOST_CPPFLAGS) $(BOTAN110_CFLAGS) $(NET_SNMP_CFLAGS) $(SANITIZER_FLAGS) -O3 -Wall -pthread -DSYSCONFDIR=\"${sysconfdir}\" $(SYSTEMD_CFLAGS)
 
 AM_CPPFLAGS += \
 	-I$(top_srcdir)/ext/json11 \
@@ -19,7 +19,9 @@ AM_LDFLAGS = \
 
 ACLOCAL_AMFLAGS = -I m4
 
-BUILT_SOURCES=htmlfiles.h
+BUILT_SOURCES=htmlfiles.h \
+	dnslabeltext.cc
+
 CLEANFILES = htmlfiles.h \
 	dnsmessage.pb.cc \
 	dnsmessage.pb.h
@@ -62,8 +64,19 @@ EXTRA_DIST = \
 sbin_PROGRAMS = pdns_recursor
 bin_PROGRAMS = rec_control
 
+if UNIT_TESTS
+noinst_PROGRAMS = testrunner
+TESTS_ENVIRONMENT = env BOOST_TEST_LOG_LEVEL=message SRCDIR='$(srcdir)'
+TESTS=testrunner
+else
+check-local:
+	@echo "Unit tests are not enabled"
+	@echo "Run ./configure --enable-unit-tests"
+endif
+
 pdns_recursor_SOURCES = \
 	arguments.cc \
+	ascii.hh \
 	base32.cc base32.hh \
 	base64.cc base64.hh \
 	cachecleaner.hh \
@@ -98,8 +111,10 @@ pdns_recursor_SOURCES = \
 	mtasker.hh \
 	mtasker_context.cc mtasker_context.hh \
 	namespaces.hh \
+	negcache.hh negcache.cc \
 	nsecrecords.cc \
 	opensslsigners.cc opensslsigners.hh \
+	packetcache.hh \
 	pdns_recursor.cc \
 	pdnsexception.hh \
 	protobuf.cc protobuf.hh \
@@ -110,6 +125,7 @@ pdns_recursor_SOURCES = \
 	rec-carbon.cc \
 	rec-lua-conf.hh rec-lua-conf.cc \
 	rec-protobuf.cc rec-protobuf.hh \
+	rec-snmp.hh rec-snmp.cc \
 	rec_channel.cc rec_channel.hh \
 	rec_channel_rec.cc \
 	recpacketcache.cc recpacketcache.hh \
@@ -127,6 +143,7 @@ pdns_recursor_SOURCES = \
 	selectmplexer.cc \
 	sholder.hh \
 	sillyrecords.cc \
+	snmp-agent.hh snmp-agent.cc \
 	sortlist.cc sortlist.hh \
 	sstuff.hh \
 	syncres.cc syncres.hh \
@@ -152,16 +169,95 @@ pdns_recursor_LDADD = \
 	$(JSON11_LIBS) \
 	$(LIBCRYPTO_LIBS) \
 	$(BOOST_CONTEXT_LIBS) \
+	$(NET_SNMP_LIBS) \
 	$(SYSTEMD_LIBS) \
 	$(RT_LIBS)
 
 pdns_recursor_LDFLAGS = $(AM_LDFLAGS) \
 	$(LIBCRYPTO_LDFLAGS) $(BOOST_CONTEXT_LDFLAGS)
 
+testrunner_SOURCES = \
+	arguments.cc \
+	base32.cc \
+	base64.cc base64.hh \
+	dns.cc dns.hh \
+	dns_random.cc dns_random.hh \
+	dnslabeltext.cc \
+	dnsname.cc dnsname.hh \
+	dnsparser.hh dnsparser.cc \
+	dnsrecords.cc \
+	dnssecinfra.cc \
+	dnswriter.cc dnswriter.hh \
+	ednscookies.cc ednscookies.hh \
+	ecs.cc \
+	ednsoptions.cc ednsoptions.hh \
+	ednssubnet.cc ednssubnet.hh \
+	filterpo.cc filterpo.hh \
+	gettime.cc gettime.hh \
+	gss_context.cc gss_context.hh \
+	iputils.cc iputils.hh \
+	logger.cc logger.hh \
+	misc.cc misc.hh \
+	negcache.hh negcache.cc \
+	namespaces.hh \
+	nsecrecords.cc \
+	pdnsexception.hh \
+	protobuf.cc protobuf.hh \
+	qtype.cc qtype.hh \
+	randomhelper.cc \
+	rcpgenerator.cc \
+	rec-protobuf.cc rec-protobuf.hh \
+	recpacketcache.cc recpacketcache.hh \
+	recursor_cache.cc recursor_cache.hh \
+	responsestats.cc \
+	root-dnssec.hh \
+	sillyrecords.cc \
+	sholder.hh \
+	sstuff.hh \
+	syncres.cc syncres.hh \
+	test-arguments_cc.cc \
+	test-base32_cc.cc \
+	test-base64_cc.cc \
+	test-dnsrecordcontent.cc \
+	test-dns_random_hh.cc \
+	test-dnsname_cc.cc \
+	test-dnsparser_hh.cc \
+	test-dnsrecords_cc.cc \
+	test-ednsoptions_cc.cc \
+	test-iputils_hh.cc \
+	test-misc_hh.cc \
+	test-nmtree.cc \
+	test-negcache_cc.cc \
+	test-rcpgenerator_cc.cc \
+	test-recpacketcache_cc.cc \
+	test-syncres_cc.cc \
+	test-tsig.cc \
+	testrunner.cc \
+	unix_utility.cc \
+	validate.cc validate.hh \
+	validate-recursor.cc validate-recursor.hh \
+	zoneparser-tng.cc zoneparser-tng.hh
+
+testrunner_LDFLAGS = \
+	$(AM_LDFLAGS) \
+	$(BOOST_UNIT_TEST_FRAMEWORK_LDFLAGS) \
+	$(LIBCRYPTO_LDFLAGS)
+
+testrunner_LDADD = \
+	$(BOOST_UNIT_TEST_FRAMEWORK_LIBS) \
+	$(LIBCRYPTO_LIBS) \
+	$(RT_LIBS)
+
 if BOTAN110
 pdns_recursor_SOURCES += \
 	botan110signers.cc
 pdns_recursor_LDADD += $(BOTAN110_LIBS)
+endif
+
+if LIBSODIUM
+pdns_recursor_SOURCES += \
+	sodiumsigners.cc
+pdns_recursor_LDADD += $(LIBSODIUM_LIBS)
 endif
 
 if MALLOC_TRACE
@@ -198,6 +294,11 @@ BUILT_SOURCES += dnsmessage.pb.cc
 pdns_recursor_LDADD += $(PROTOBUF_LIBS)
 nodist_pdns_recursor_SOURCES = dnsmessage.pb.cc dnsmessage.pb.h
 pdns_recursor.$(OBJEXT): dnsmessage.pb.cc
+
+nodist_testrunner_SOURCES = dnsmessage.pb.cc dnsmessage.pb.h
+testrunner_LDADD += $(PROTOBUF_LIBS)
+testrunner$(OBJEXT): dnsmessage.pb.cc
+
 endif
 endif
 

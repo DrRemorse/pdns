@@ -98,8 +98,8 @@ The DNSQuestion object contains at least the following fields:
      * policyAction: The action taken by the engine
      * policyCustom: The CNAME content for the `pdns.policyactions.Custom` response, a string
      * policyTTL: The TTL in seconds for the `pdns.policyactions.Custom` response
-* wantsRPZ - A boolean that indicates the use of the Policy Engine, can be set to `false` in `preresolve` to disable RPZ for this query
-* data - a table that is persistent throughout the lifetime of the `dq` object and can be used to store custom data. All keys and values in the table must be of type `string`.
+* wantsRPZ - A boolean that indicates the use of the Policy Engine, can be set to `false` in `prerpz` to disable RPZ for this query
+* data - a Lua object reference that is persistent throughout the lifetime of the `dq` object for a single query. It can be used to store custom data. Most scripts initialise this to an empty table early on so they can store multiple items.
 
 It also supports the following methods:
 
@@ -107,11 +107,7 @@ It also supports the following methods:
   the answer too, which defaults to the name of the question
 * `addPolicyTag(tag)`: add a policy tag.
 * `discardPolicy(policyname)`: skip the filtering policy (for example RPZ) named `policyname` for this query. This is mostly useful in the `prerpz` hook.
-* `getDH()` - Returns the DNS Header of the query or nil. A DNS header offers the following methods:
-     * `getRD()`, `getAA()`, `getAD()`, `getCD()`, `getTC()`: query these bits from the DNS Header
-     * `getRCODE()`: get the RCODE of the query
-     * `getOPCODE()`: get the OPCODE of the query
-     * `getID()`: get the ID of the query
+* `getDH()` - Returns the DNS Header of the query or nil.
 * `getPolicyTags()`: get the current policy tags as a table of strings.
 * `getRecords()`: get a table of DNS Records in this DNS Question (or answer by now)
 * `setPolicyTags(tags)`: update the policy tags, taking a table of strings.
@@ -124,6 +120,12 @@ It also supports the following methods:
 * `addPolicyTag(tag)`: Add policyTag `tag` to the list of policyTags
 * `getPolicyTags()`: Get a list the policyTags for this message
 * `setPolicyTags(tags)`: Set the policyTags for this message to `tags` (a list)
+
+A DNS header as returned by `getDH()` offers the following methods:
+* `getRD()`, `getAA()`, `getAD()`, `getCD()`, `getTC()`: query these bits from the DNS Header
+* `getRCODE()`: get the RCODE of the query
+* `getOPCODE()`: get the OPCODE of the query
+* `getID()`: get the ID of the query
 
 ## `function ipfilter ( remoteip, localip, dh )`
 This hook gets queried immediately after consulting the packet cache, but before
@@ -151,20 +153,27 @@ end
 This hook does not get the full DNSQuestion object, since filling out the fields
 would require packet parsing, which is what we are trying to prevent with `ipfilter`.
 
-### `function gettag(remote, ednssubnet, local, qname, qtype)`
+### `function gettag(remote, ednssubnet, local, qname, qtype, ednsoptions)`
 The `gettag` function is invoked when the Recursor attempts to discover in which
 packetcache an answer is available.
+
 This function must return an integer, which is the tag number of the packetcache.
 In addition to this integer, this function can return a table of policy tags.
-
 The resulting tag number can be accessed via `dq.tag` in the `preresolve` hook,
 and the policy tags via `dq:getPolicyTags()` in every hook.
+Starting with 4.1.0, it can also return a table whose keys and values are strings
+to fill the upcoming `DNSQuestion`'s `data` table.
 
 The tagged packetcache can e.g. be used to answer queries from cache that have
 e.g. been filtered for certain IPs (this logic should be implemented in the
 `gettag` function). This ensure that queries are answered quickly compared to
 setting dq.variable to `true`. In the latter case, repeated queries will pass
 through the entire Lua script.
+
+`ednsoptions` is a table whose keys are EDNS option codes and values are
+`EDNSOptionView` objects, with the EDNS option content size in the `size` member
+and the content accessible as a NULL-safe string object via `getContent()`.
+This table is empty unless the `gettag-needs-edns-options` parameter is set.
 
 ### `function prerpz(dq)`
 
@@ -182,6 +191,7 @@ function prerpz(dq)
   if dq.qname:equal('example.com') then
     dq:discardPolicy('malware')
   end
+  return false
 end
 ```
 
@@ -525,3 +535,16 @@ The kind of policy response, there are several policy kinds:
 These fields are only used when `dq.appliedPolicy.policyKind` is set to `pdns.policykinds.Custom`.
 `dq.appliedPolicy.policyCustom` contains the name for the CNAME target as a string.
 And `dq.appliedPolicy.policyTTL` is the TTL field (in seconds) for the CNAME response.
+
+## SNMP Traps
+PowerDNS Recursor, when compiled with SNMP support, has the ability to act as a
+SNMP agent to provide SNMP statistics and to be able to send traps from Lua.
+
+For example, to send a custom SNMP trap containing the qname from the `preresolve` hook:
+
+```
+function preresolve(dq)
+  sendCustomSNMPTrap('Trap from preresolve, qname is '..dq.qname:toString())
+  return false
+end
+```

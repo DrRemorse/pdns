@@ -1,31 +1,31 @@
 /*
-    PowerDNS Versatile Database Driven Nameserver
-    Copyright (C) 2005 - 2011  PowerDNS.COM BV
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License version 2 as 
-    published by the Free Software Foundation
-
-    Additionally, the license of this program contains a special
-    exception which allows to distribute the program in binary form when
-    it is linked against OpenSSL.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-*/
+ * This file is part of PowerDNS or dnsdist.
+ * Copyright -- PowerDNS.COM B.V. and its contributors
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * In addition, for the avoidance of any doubt, permission is granted to
+ * link this program with OpenSSL and to (re)distribute the binaries
+ * produced as the result of such linking.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 #include <boost/archive/binary_iarchive.hpp>
 #include <boost/archive/binary_oarchive.hpp>
 
-#include "packetcache.hh"
+#include "auth-querycache.hh"
 #include "utility.hh"
 
 
@@ -444,30 +444,22 @@ void UeberBackend::cleanup()
   for_each(backends.begin(),backends.end(),del);
 }
 
-// silly Solaris fix
-#undef PC
-
 // returns -1 for miss, 0 for negative match, 1 for hit
 int UeberBackend::cacheHas(const Question &q, vector<DNSZoneRecord> &rrs)
 {
-  extern PacketCache PC;
-  static AtomicCounter *qcachehit=S.getPointer("query-cache-hit");
-  static AtomicCounter *qcachemiss=S.getPointer("query-cache-miss");
+  extern AuthQueryCache QC;
 
   if(!d_cache_ttl && ! d_negcache_ttl) {
-    (*qcachemiss)++;
     return -1;
   }
 
   rrs.clear();
   //  L<<Logger::Warning<<"looking up: '"<<q.qname+"'|N|"+q.qtype.getName()+"|"+itoa(q.zoneId)<<endl;
 
-  bool ret=PC.getEntry(q.qname, q.qtype, PacketCache::QUERYCACHE, rrs, q.zoneId);   // think about lowercasing here
+  bool ret=QC.getEntry(q.qname, q.qtype, rrs, q.zoneId);   // think about lowercasing here
   if(!ret) {
-    (*qcachemiss)++;
     return -1;
   }
-  (*qcachehit)++;
   if(rrs.empty()) // negatively cached
     return 0;
   
@@ -476,16 +468,16 @@ int UeberBackend::cacheHas(const Question &q, vector<DNSZoneRecord> &rrs)
 
 void UeberBackend::addNegCache(const Question &q)
 {
-  extern PacketCache PC;
+  extern AuthQueryCache QC;
   if(!d_negcache_ttl)
     return;
   // we should also not be storing negative answers if a pipebackend does scopeMask, but we can't pass a negative scopeMask in an empty set!
-  PC.insert(q.qname, q.qtype, PacketCache::QUERYCACHE, vector<DNSZoneRecord>(), d_negcache_ttl, q.zoneId);
+  QC.insert(q.qname, q.qtype, vector<DNSZoneRecord>(), d_negcache_ttl, q.zoneId);
 }
 
 void UeberBackend::addCache(const Question &q, const vector<DNSZoneRecord> &rrs)
 {
-  extern PacketCache PC;
+  extern AuthQueryCache QC;
 
   if(!d_cache_ttl)
     return;
@@ -498,7 +490,7 @@ void UeberBackend::addCache(const Question &q, const vector<DNSZoneRecord> &rrs)
      return;
   }
 
-  PC.insert(q.qname, q.qtype, PacketCache::QUERYCACHE, rrs, store_ttl, q.zoneId);
+  QC.insert(q.qname, q.qtype, rrs, store_ttl, q.zoneId);
 }
 
 void UeberBackend::alsoNotifies(const DNSName &domain, set<string> *ips)
@@ -580,19 +572,6 @@ void UeberBackend::getAllDomains(vector<DomainInfo> *domains, bool include_disab
   }
 }
 
-bool UeberBackend::get(DNSResourceRecord &rr)
-{
-  // cout<<"UeberBackend::get(DNSResourceRecord&) called, translating to a DNSZoneRecord query"<<endl;
-  DNSZoneRecord dzr;
-  if(!this->get(dzr))
-    return false;
-
-  rr=DNSResourceRecord(dzr.dr);
-  rr.auth = dzr.auth;
-  rr.domain_id = dzr.domain_id;
-  return true;
-}
-
 bool UeberBackend::get(DNSZoneRecord &rr)
 {
   // cout<<"UeberBackend::get(DNSZoneRecord) called"<<endl;
@@ -610,7 +589,7 @@ bool UeberBackend::get(DNSZoneRecord &rr)
   if(!d_handle.get(rr)) {
     // cout<<"end of ueberbackend get, seeing if we should cache"<<endl;
     if(!d_ancount && d_handle.qname.countLabels()) {// don't cache axfr
-      // cout<<"adding negache"<<endl;
+      // cout<<"adding negcache"<<endl;
       addNegCache(d_question);
     }
     else {

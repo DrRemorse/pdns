@@ -34,7 +34,6 @@
 #include "dns_random.hh"
 
 extern StatBag S;
-extern PacketCache PC;
 
 DNSProxy::DNSProxy(const string &remote)
 {
@@ -42,7 +41,10 @@ DNSProxy::DNSProxy(const string &remote)
   d_resanswers=S.getPointer("recursing-answers");
   d_resquestions=S.getPointer("recursing-questions");
   d_udpanswers=S.getPointer("udp-answers");
-  ComboAddress remaddr(remote, 53);
+
+  vector<string> addresses;
+  stringtok(addresses, remote, " ,\t");
+  ComboAddress remaddr(addresses[0], 53);
   
   if((d_sock=socket(remaddr.sin4.sin_family, SOCK_DGRAM,0))<0)
     throw PDNSException(string("socket: ")+strerror(errno));
@@ -79,23 +81,9 @@ void DNSProxy::go()
   pthread_create(&tid,0,&launchhelper,this);
 }
 
-
-void DNSProxy::onlyFrom(const string &ips)
-{
-  d_ng.toMasks(ips);
-}
-
-bool DNSProxy::recurseFor(DNSPacket* p)
-{
-  return d_ng.match((ComboAddress *)&p->d_remote);
-}
-
 /** returns false if p->remote is not allowed to recurse via us */
 bool DNSProxy::sendPacket(DNSPacket *p)
 {
-  if(!recurseFor(p))
-    return false;
-
   uint16_t id;
   {
     Lock l(&d_lock);
@@ -283,7 +271,6 @@ void DNSProxy::mainloop(void)
         if(sendmsg(i->second.outsock, &msgh, 0) < 0)
           L<<Logger::Warning<<"dnsproxy.cc: Error sending reply with sendmsg (socket="<<i->second.outsock<<"): "<<strerror(errno)<<endl;
         
-        PC.insert(&q, &p, true);
         i->second.created=0;
       }
     }

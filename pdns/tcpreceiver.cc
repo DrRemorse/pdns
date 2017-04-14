@@ -23,7 +23,7 @@
 #include "config.h"
 #endif
 #include <boost/algorithm/string.hpp>
-#include "packetcache.hh"
+#include "auth-packetcache.hh"
 #include "utility.hh"
 #include "dnssecinfra.hh"
 #include "dnsseckeeper.hh"
@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <sys/types.h>
+#include <netinet/tcp.h>
 #include <iostream>
 #include <string>
 #include "tcpreceiver.hh"
@@ -56,7 +57,7 @@
 #include "namespaces.hh"
 #include "signingpipe.hh"
 #include "stubresolver.hh"
-extern PacketCache PC;
+extern AuthPacketCache PC;
 extern StatBag S;
 
 /**
@@ -217,49 +218,6 @@ catch(NetworkError& ae) {
   throw NetworkError("Error reading DNS data from TCP client "+remote.toString()+": "+ae.what());
 }
 
-static void proxyQuestion(shared_ptr<DNSPacket> packet, unsigned int idleTimeout)
-{
-  int sock=socket(AF_INET, SOCK_STREAM, 0);
-  
-  setCloseOnExec(sock);
-  if(sock < 0)
-    throw NetworkError("Error making TCP connection socket to recursor: "+stringerror());
-
-  setNonBlocking(sock);
-  ServiceTuple st;
-  st.port=53;
-  parseService(::arg()["recursor"],st);
-
-  try {
-    ComboAddress recursor(st.host, st.port);
-    connectWithTimeout(sock, (struct sockaddr*)&recursor, recursor.getSocklen());
-    const string &buffer=packet->getString();
-    
-    uint16_t len=htons(buffer.length()), slen;
-    
-    writenWithTimeout(sock, &len, 2, idleTimeout);
-    writenWithTimeout(sock, buffer.c_str(), buffer.length(), idleTimeout);
-    
-    readnWithTimeout(sock, &len, 2, idleTimeout);
-    len=ntohs(len);
-
-    char answer[len];
-    readnWithTimeout(sock, answer, len, idleTimeout);
-
-    slen=htons(len);
-    writenWithTimeout(packet->getSocket(), &slen, 2, idleTimeout);
-    
-    writenWithTimeout(packet->getSocket(), answer, len, idleTimeout);
-  }
-  catch(NetworkError& ae) {
-    close(sock);
-    throw NetworkError("While proxying a question to recursor "+st.host+": " +ae.what());
-  }
-  close(sock);
-  return;
-}
-
-
 static void incTCPAnswerCount(const ComboAddress& remote)
 {
   S.inc("tcp-answers");
@@ -399,7 +357,7 @@ void *TCPNameserver::doConnection(void *data)
       }
 
 
-      if(!packet->d.rd && packet->couldBeCached() && PC.get(packet.get(), cached.get(), false)) { // short circuit - does the PacketCache recognize this question?
+      if(packet->couldBeCached() && PC.get(packet.get(), cached.get())) { // short circuit - does the PacketCache recognize this question?
         if(logDNSQueries)
           L<<"packetcache HIT"<<endl;
         cached->setRemote(&packet->d_remote);
@@ -420,16 +378,10 @@ void *TCPNameserver::doConnection(void *data)
           L<<Logger::Error<<"TCP server is without backend connections, launching"<<endl;
           s_P=new PacketHandler;
         }
-        bool shouldRecurse;
 
-        reply=shared_ptr<DNSPacket>(s_P->questionOrRecurse(packet.get(), &shouldRecurse)); // we really need to ask the backend :-)
+        reply=shared_ptr<DNSPacket>(s_P->doQuestion(packet.get())); // we really need to ask the backend :-)
 
         if(LPE) LPE->police(&(*packet), &(*reply), true);
-
-        if(shouldRecurse) {
-          proxyQuestion(packet, d_idleTimeout);
-          continue;
-        }
       }
 
       if(!reply)  // unable to write an answer?
@@ -479,7 +431,7 @@ bool TCPNameserver::canDoAXFR(shared_ptr<DNSPacket> q)
     TSIGRecordContent trc;
     DNSName keyname;
     string secret;
-    if(!checkForCorrectTSIG(q.get(), s_P->getBackend(), &keyname, &secret, &trc)) {
+    if(!q->checkForCorrectTSIG(s_P->getBackend(), &keyname, &secret, &trc)) {
       return false;
     } else {
       getTSIGHashEnum(trc.d_algoName, q->d_tsig_algo);
@@ -543,7 +495,7 @@ bool TCPNameserver::canDoAXFR(shared_ptr<DNSPacket> q)
         while(B->get(rr)) 
           nsset.insert(DNSName(rr.content));
         for(const auto & j: nsset) {
-          vector<string> nsips=fns.lookup(j, B);
+          vector<string> nsips=fns.lookup(j, s_P->getBackend());
           for(vector<string>::const_iterator k=nsips.begin();k!=nsips.end();++k) {
             // cerr<<"got "<<*k<<" from AUTO-NS"<<endl;
             if(*k == q->getRemote().toString())
@@ -596,7 +548,6 @@ namespace {
     soa.ttl=sd.ttl;
     soa.domain_id=sd.domain_id;
     soa.auth = true;
-    soa.d_place=DNSResourceRecord::ANSWER;
     return soa;
   }
 
@@ -683,7 +634,7 @@ int TCPNameserver::doAXFR(const DNSName &target, shared_ptr<DNSPacket> q, int ou
   DNSName tsigkeyname;
   string tsigsecret;
 
-  bool haveTSIGDetails = q->getTSIGDetails(&trc, &tsigkeyname, 0);
+  bool haveTSIGDetails = q->getTSIGDetails(&trc, &tsigkeyname);
 
   if(haveTSIGDetails && !tsigkeyname.empty()) {
     string tsig64;
@@ -857,6 +808,11 @@ int TCPNameserver::doAXFR(const DNSName &target, shared_ptr<DNSPacket> q, int ou
       continue;
     }
   }
+
+  // Group records by name and type, signpipe stumbles over interrupted rrsets
+  sort(zrrs.begin(), zrrs.end(), [](const DNSZoneRecord& a, const DNSZoneRecord& b) {
+    return tie(a.dr.d_name, a.dr.d_type) < tie(b.dr.d_name, b.dr.d_type);
+  });
 
   if(rectify) {
     // set auth
@@ -1197,7 +1153,7 @@ int TCPNameserver::doIXFR(shared_ptr<DNSPacket> q, int outsock)
     DNSName tsigkeyname;
     string tsigsecret;
 
-    bool haveTSIGDetails = q->getTSIGDetails(&trc, &tsigkeyname, 0);
+    bool haveTSIGDetails = q->getTSIGDetails(&trc, &tsigkeyname);
 
     if(haveTSIGDetails && !tsigkeyname.empty()) {
       string tsig64;
@@ -1283,7 +1239,18 @@ TCPNameserver::TCPNameserver()
       L<<Logger::Error<<"Setsockopt failed"<<endl;
       exit(1);  
     }
-    
+
+    if (::arg().asNum("tcp-fast-open") > 0) {
+#ifdef TCP_FASTOPEN
+      int fastOpenQueueSize = ::arg().asNum("tcp-fast-open");
+      if (setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN, &fastOpenQueueSize, sizeof fastOpenQueueSize) < 0) {
+        L<<Logger::Error<<"Failed to enable TCP Fast Open for listening socket: "<<strerror(errno)<<endl;
+      }
+#else
+      L<<Logger::Warning<<"TCP Fast Open configured but not supported for listening socket"<<endl;
+#endif
+    }
+
     if( ::arg().mustDo("non-local-bind") )
 	Utility::setBindAny(AF_INET, s);
 
@@ -1324,6 +1291,18 @@ TCPNameserver::TCPNameserver()
       L<<Logger::Error<<"Setsockopt failed"<<endl;
       exit(1);  
     }
+
+    if (::arg().asNum("tcp-fast-open") > 0) {
+#ifdef TCP_FASTOPEN
+      int fastOpenQueueSize = ::arg().asNum("tcp-fast-open");
+      if (setsockopt(s, IPPROTO_TCP, TCP_FASTOPEN, &fastOpenQueueSize, sizeof fastOpenQueueSize) < 0) {
+        L<<Logger::Error<<"Failed to enable TCP Fast Open for listening socket: "<<strerror(errno)<<endl;
+      }
+#else
+      L<<Logger::Warning<<"TCP Fast Open configured but not supported for listening socket"<<endl;
+#endif
+    }
+
     if( ::arg().mustDo("non-local-bind") )
 	Utility::setBindAny(AF_INET6, s);
     if(setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &tmp, sizeof(tmp)) < 0) {

@@ -30,14 +30,14 @@ struct DNSQuestion;
 class DNSDistPacketCache : boost::noncopyable
 {
 public:
-  DNSDistPacketCache(size_t maxEntries, uint32_t maxTTL=86400, uint32_t minTTL=0, uint32_t tempFailureTTL=60, uint32_t staleTTL=60);
+  DNSDistPacketCache(size_t maxEntries, uint32_t maxTTL=86400, uint32_t minTTL=0, uint32_t tempFailureTTL=60, uint32_t staleTTL=60, bool dontAge=false);
   ~DNSDistPacketCache();
 
   void insert(uint32_t key, const DNSName& qname, uint16_t qtype, uint16_t qclass, const char* response, uint16_t responseLen, bool tcp, uint8_t rcode);
   bool get(const DNSQuestion& dq, uint16_t consumed, uint16_t queryId, char* response, uint16_t* responseLen, uint32_t* keyOut, uint32_t allowExpired=0, bool skipAging=false);
   void purgeExpired(size_t upTo=0);
   void expunge(size_t upTo=0);
-  void expungeByName(const DNSName& name, uint16_t qtype=QType::ANY);
+  void expungeByName(const DNSName& name, uint16_t qtype=QType::ANY, bool suffixMatch=false);
   bool isFull();
   string toString();
   uint64_t getSize() const { return d_map.size(); }
@@ -85,4 +85,5 @@ private:
   uint32_t d_tempFailureTTL;
   uint32_t d_minTTL;
   uint32_t d_staleTTL;
+  bool d_dontAge;
 };

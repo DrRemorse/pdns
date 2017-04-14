@@ -25,7 +25,10 @@
 #include "namespaces.hh"
 #include "dnsrecords.hh"
 #include "filterpo.hh"
+#include "ednsoptions.hh"
+
 #include <unordered_map>
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -35,12 +38,16 @@ unsigned int getRecursorThreadId();
 
 class LuaContext;
 
+#if defined(HAVE_LUA)
+#undef L
+#include "ext/luawrapper/include/LuaContext.hpp"
+#define L theL()
+#endif
+
 class RecursorLua4 : public boost::noncopyable
 {
 private:
-#ifdef HAVE_LUA
   std::unique_ptr<LuaContext> d_lw; // this is way on top because it must get destroyed _last_
-#endif
 
 public:
   explicit RecursorLua4(const std::string& fname);
@@ -65,9 +72,8 @@ public:
     std::unordered_map<std::string,bool>* discardedPolicies{nullptr};
     bool& variable;
     bool& wantsRPZ;
-    int tag{0};
+    unsigned int tag{0};
 
-#ifdef HAVE_LUA
     void addAnswer(uint16_t type, const std::string& content, boost::optional<int> ttl, boost::optional<string> name);
     void addRecord(uint16_t type, const std::string& content, DNSResourceRecord::Place place, boost::optional<int> ttl, boost::optional<string> name);
     vector<pair<int,DNSRecord> > getRecords() const;
@@ -91,12 +97,11 @@ public:
     string udpAnswer;
     string udpCallback;
     
-    std::unordered_map<string,string> data;
+    LuaContext::LuaObject data;
     DNSName followupName;
-#endif
   };
 
-  int gettag(const ComboAddress& remote, const Netmask& ednssubnet, const ComboAddress& local, const DNSName& qname, uint16_t qtype, std::vector<std::string>* policyTags);
+  unsigned int gettag(const ComboAddress& remote, const Netmask& ednssubnet, const ComboAddress& local, const DNSName& qname, uint16_t qtype, std::vector<std::string>* policyTags, LuaContext::LuaObject& data, const std::map<uint16_t, EDNSOptionView>&);
 
   bool prerpz(DNSQuestion& dq, int& ret);
   bool preresolve(DNSQuestion& dq, int& ret);
@@ -116,7 +121,7 @@ public:
             d_postresolve);
   }
 
-  typedef std::function<std::tuple<int,boost::optional<std::unordered_map<int,string> > >(ComboAddress, Netmask, ComboAddress, DNSName, uint16_t)> gettag_t;
+  typedef std::function<std::tuple<unsigned int,boost::optional<std::unordered_map<int,string> >,boost::optional<LuaContext::LuaObject> >(ComboAddress, Netmask, ComboAddress, DNSName, uint16_t, const std::map<uint16_t, EDNSOptionView>&)> gettag_t;
   gettag_t d_gettag; // public so you can query if we have this hooked
 
 private:

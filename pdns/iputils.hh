@@ -477,7 +477,7 @@ private:
  * To erase something copy values to new tree sans the value you want to erase.
  *
  * Use swap if you need to move the tree to another NetmaskTree instance, it is WAY faster
- * than using copy ctor or assigment operator, since it moves the nodes and tree root to
+ * than using copy ctor or assignment operator, since it moves the nodes and tree root to
  * new home instead of actually recreating the tree.
  *
  * Please see NetmaskGroup for example of simple use case. Other usecases can be found
@@ -710,8 +710,12 @@ public:
         bits++;
       }
       if (node) {
-        for(auto it = _nodes.begin(); it != _nodes.end(); it++)
-           if (node->node4.get() == *it) _nodes.erase(it);
+        for(auto it = _nodes.begin(); it != _nodes.end(); ) {
+          if (node->node4.get() == *it)
+            it = _nodes.erase(it);
+          else
+            it++;
+        }
         node->node4.reset();
       }
     } else {
@@ -731,8 +735,13 @@ public:
         bits++;
       }
       if (node) {
-        for(auto it = _nodes.begin(); it != _nodes.end(); it++)
-           if (node->node6.get() == *it) _nodes.erase(it);
+        for(auto it = _nodes.begin(); it != _nodes.end(); ) {
+          if (node->node6.get() == *it)
+            it = _nodes.erase(it);
+          else
+            it++;
+        }
+
         node->node6.reset();
       }
     }
@@ -901,7 +910,10 @@ bool HarvestTimestamp(struct msghdr* msgh, struct timeval* tv);
 void fillMSGHdr(struct msghdr* msgh, struct iovec* iov, char* cbuf, size_t cbufsize, char* data, size_t datalen, ComboAddress* addr);
 ssize_t sendfromto(int sock, const char* data, size_t len, int flags, const ComboAddress& from, const ComboAddress& to);
 ssize_t sendMsgWithTimeout(int fd, const char* buffer, size_t len, int timeout, ComboAddress& dest, const ComboAddress& local, unsigned int localItf);
-
-#endif
+bool sendSizeAndMsgWithTimeout(int sock, uint16_t bufferLen, const char* buffer, int idleTimeout, const ComboAddress* dest, const ComboAddress* local, unsigned int localItf, int totalTimeout, int flags);
+/* requires a non-blocking, connected TCP socket */
+bool isTCPSocketUsable(int sock);
 
 extern template class NetmaskTree<bool>;
+
+#endif

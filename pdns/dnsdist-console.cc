@@ -212,8 +212,8 @@ void doConsole()
             >
           >(withReturn ? ("return "+line) : line);
         if(ret) {
-          if (const auto strValue = boost::get<shared_ptr<DownstreamState>>(&*ret)) {
-            cout<<(*strValue)->getName()<<endl;
+          if (const auto dsValue = boost::get<shared_ptr<DownstreamState>>(&*ret)) {
+            cout<<(*dsValue)->getName()<<endl;
           }
           else if (const auto strValue = boost::get<string>(&*ret)) {
             cout<<*strValue<<endl;
@@ -253,17 +253,16 @@ void doConsole()
         std::rethrow_if_nested(e);
 
         std::cerr << std::endl;
-      } catch(const std::exception& e) {
-        // e is the exception that was thrown from inside the lambda
-        std::cerr << ": " << e.what() << std::endl;      
+      } catch(const std::exception& ne) {
+        // ne is the exception that was thrown from inside the lambda
+        std::cerr << ": " << ne.what() << std::endl;
       }
-      catch(const PDNSException& e) {
-        // e is the exception that was thrown from inside the lambda
-        std::cerr << ": " << e.reason << std::endl;      
+      catch(const PDNSException& ne) {
+        // ne is the exception that was thrown from inside the lambda
+        std::cerr << ": " << ne.reason << std::endl;
       }
     }
     catch(const std::exception& e) {
-      // e is the exception that was thrown from inside the lambda
       std::cerr << e.what() << std::endl;      
     }
   }
@@ -309,8 +308,8 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "exceedNXDOMAINs", true, "rate, seconds", "get set of addresses that exceed `rate` NXDOMAIN/s over `seconds` seconds" },
   { "exceedQRate", true, "rate, seconds", "get set of address that exceed `rate` queries/s over `seconds` seconds" },
   { "exceedQTypeRate", true, "type, rate, seconds", "get set of address that exceed `rate` queries/s for queries of type `type` over `seconds` seconds" },
-  { "exceedRespByterate", true, "rate, seconds", "get set of addresses that exeeded `rate` bytes/s answers over `seconds` seconds" },
-  { "exceedServFails", true, "rate, seconds", "get set of addresses that exceed `rate` servails/s over `seconds` seconds" },
+  { "exceedRespByterate", true, "rate, seconds", "get set of addresses that exceeded `rate` bytes/s answers over `seconds` seconds" },
+  { "exceedServFails", true, "rate, seconds", "get set of addresses that exceed `rate` servfails/s over `seconds` seconds" },
   { "firstAvailable", false, "", "picks the server with the lowest `order` that has not exceeded its QPS limit" },
   { "fixupCase", true, "bool", "if set (default to no), rewrite the first qname of the question part of the answer to match the one from the query. It is only useful when you have a downstream server that messes up the case of the question qname in the answer" },
   { "generateDNSCryptCertificate", true, "\"/path/to/providerPrivate.key\", \"/path/to/resolver.cert\", \"/path/to/resolver.key\", serial, validFrom, validUntil", "generate a new resolver private key and related certificate, valid from the `validFrom` timestamp until the `validUntil` one, signed with the provider private key" },
@@ -330,6 +329,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "mvResponseRule", true, "from, to", "move response rule 'from' to a position where it is in front of 'to'. 'to' can be one larger than the largest rule" },
   { "mvRule", true, "from, to", "move rule 'from' to a position where it is in front of 'to'. 'to' can be one larger than the largest rule, in which case the rule will be moved to the last position" },
   { "newDNSName", true, "name", "make a DNSName based on this .-terminated name" },
+  { "newPacketCache", true, "maxEntries[, maxTTL=86400, minTTL=0, temporaryFailureTTL=60, staleTTL=60, dontAge=false]", "return a new Packet Cache" },
   { "newQPSLimiter", true, "rate, burst", "configure a QPS limiter with that rate and that burst capacity" },
   { "newRemoteLogger", true, "address:port [, timeout=2, maxQueuedEntries=100, reconnectWaitTime=1]", "create a Remote Logger object, to use with `RemoteLogAction()` and `RemoteLogResponseAction()`" },
   { "newRuleAction", true, "DNS rule, DNS action", "return a pair of DNS Rule and DNS Action, to be used with `setRules()`" },
@@ -352,6 +352,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "QNameWireLengthRule", true, "min, max", "matches if the qname's length on the wire is less than `min` or more than `max` bytes" },
   { "QTypeRule", true, "qtype", "matches queries with the specified qtype" },
   { "RCodeRule", true, "rcode", "matches responses with the specified rcode" },
+  { "sendCustomTrap", true, "str", "send a custom `SNMP` trap from Lua, containing the `str` string"},
   { "setACL", true, "{netmask, netmask}", "replace the ACL set with these netmasks. Use `setACL({})` to reset the list, meaning no one can use us" },
   { "setAPIWritable", true, "bool, dir", "allow modifications via the API. if `dir` is set, it must be a valid directory where the configuration files will be written by the API" },
   { "setDNSSECPool", true, "pool name", "move queries requesting DNSSEC processing to this pool" },
@@ -366,6 +367,8 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "setMaxTCPQueriesPerConnection", true, "n", "set the maximum number of queries in an incoming TCP connection. 0 means unlimited" },
   { "setMaxTCPQueuedConnections", true, "n", "set the maximum number of TCP connections queued (waiting to be picked up by a client thread)" },
   { "setMaxUDPOutstanding", true, "n", "set the maximum number of outstanding UDP queries to a given backend server. This can only be set at configuration time and defaults to 10240" },
+  { "setPoolServerPolicy", true, "policy, pool", "set the server selection policy for this pool to that policy" },
+  { "setPoolServerPolicy", true, "name, func, pool", "set the server selection policy for this pool to one named 'name' and provided by 'function'" },
   { "setQueryCount", true, "bool", "set whether queries should be counted" },
   { "setQueryCountFilter", true, "func", "filter queries that would be counted, where `func` is a function with parameter `dq` which decides whether a query should and how it should be counted" },
   { "setRingBuffersSize", true, "n", "set the capacity of the ringbuffers used for live traffic inspection to `n`" },
@@ -373,6 +376,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "setServerPolicy", true, "policy", "set server selection policy to that policy" },
   { "setServerPolicyLua", true, "name, function", "set server selection policy to one named 'name' and provided by 'function'" },
   { "setServFailWhenNoServer", true, "bool", "if set, return a ServFail when no servers are available, instead of the default behaviour of dropping the query" },
+  { "setTCPDownstreamCleanupInterval", true, "interval", "minimum interval in seconds between two cleanups of the idle TCP downstream connections" },
   { "setTCPUseSinglePipe", true, "bool", "whether the incoming TCP connections should be put into a single queue instead of using per-thread queues. Defaults to false" },
   { "setTCPRecvTimeout", true, "n", "set the read timeout on TCP connections from the client, in seconds" },
   { "setTCPSendTimeout", true, "n", "set the write timeout on TCP connections from the client, in seconds" },
@@ -383,6 +387,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "showCacheHitResponseRules", true, "", "show all defined cache hit response rules" },
   { "showDNSCryptBinds", true, "", "display the currently configured DNSCrypt binds" },
   { "showDynBlocks", true, "", "show dynamic blocks in force" },
+  { "showPoolServerPolicy", true, "pool", "show server selection policy for this pool" },
   { "showResponseLatency", true, "", "show a plot of the response time latency distribution" },
   { "showResponseRules", true, "", "show all defined response rules" },
   { "showRules", true, "", "show all defined rules" },
@@ -391,6 +396,9 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "showTCPStats", true, "", "show some statistics regarding TCP" },
   { "showVersion", true, "", "show the current version" },
   { "shutdown", true, "", "shut down `dnsdist`" },
+  { "snmpAgent", true, "enableTraps [, masterSocket]", "enable `SNMP` support. `enableTraps` is a boolean indicating whether traps should be sent and `masterSocket` an optional string specifying how to connect to the master agent"},
+  { "SNMPTrapAction", true, "[reason]", "send an SNMP trap, adding the optional `reason` string as the query description"},
+  { "SNMPTrapResponseAction", true, "[reason]", "send an SNMP trap, adding the optional `reason` string as the response description"},
   { "SpoofAction", true, "{ip, ...} ", "forge a response with the specified IPv4 (for an A query) or IPv6 (for an AAAA). If you specify multiple addresses, all that match the query type (A, AAAA or ANY) will get spoofed in" },
   { "TCAction", true, "", "create answer to query with TC and RD bits set, to move to TCP" },
   { "testCrypto", true, "", "test of the crypto all works" },
@@ -498,8 +506,8 @@ try
           >(withReturn ? ("return "+line) : line);
 
       if(ret) {
-	if (const auto strValue = boost::get<shared_ptr<DownstreamState>>(&*ret)) {
-	  response=(*strValue)->getName()+"\n";
+	if (const auto dsValue = boost::get<shared_ptr<DownstreamState>>(&*ret)) {
+	  response=(*dsValue)->getName()+"\n";
 	}
 	else if (const auto strValue = boost::get<string>(&*ret)) {
 	  response=*strValue+"\n";
@@ -537,13 +545,13 @@ try
         response = "Error: " + string(e.what());
       try {
         std::rethrow_if_nested(e);
-      } catch(const std::exception& e) {
-        // e is the exception that was thrown from inside the lambda
-        response+= ": " + string(e.what());
+      } catch(const std::exception& ne) {
+        // ne is the exception that was thrown from inside the lambda
+        response+= ": " + string(ne.what());
       }
-      catch(const PDNSException& e) {
-        // e is the exception that was thrown from inside the lambda
-        response += ": " + string(e.reason);
+      catch(const PDNSException& ne) {
+        // ne is the exception that was thrown from inside the lambda
+        response += ": " + string(ne.reason);
       }
     }
     catch(const LuaContext::SyntaxErrorException& e) {

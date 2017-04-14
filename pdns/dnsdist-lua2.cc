@@ -109,8 +109,8 @@ static void statNodeRespRing(statvisitor_t visitor, unsigned int seconds)
   }
   StatNode::Stat node;
 
-  root.visit([&visitor](const StatNode* node, const StatNode::Stat& self, const StatNode::Stat& children) {
-      visitor(*node, self, children);},  node);  
+  root.visit([&visitor](const StatNode* node_, const StatNode::Stat& self, const StatNode::Stat& children) {
+      visitor(*node_, self, children);},  node);
 
 }
 
@@ -643,15 +643,19 @@ void moreLua(bool client)
       setLuaNoSideEffect();
       try {
         ostringstream ret;
-        boost::format fmt("%1$-20.20s %|25t|%2$20s %|50t|%3%" );
-        //             1        3         4
-        ret << (fmt % "Name" % "Cache" % "Servers" ) << endl;
+        boost::format fmt("%1$-20.20s %|25t|%2$20s %|25t|%3$20s %|50t|%4%" );
+        //             1        2         3                4
+        ret << (fmt % "Name" % "Cache" % "ServerPolicy" % "Servers" ) << endl;
 
         const auto localPools = g_pools.getCopy();
         for (const auto& entry : localPools) {
           const string& name = entry.first;
           const std::shared_ptr<ServerPool> pool = entry.second;
           string cache = pool->packetCache != nullptr ? pool->packetCache->toString() : "";
+          string policy = g_policy.getLocal()->name;
+          if (pool->policy != nullptr) {
+            policy = pool->policy->name;
+          }
           string servers;
 
           for (const auto& server: pool->servers) {
@@ -665,7 +669,7 @@ void moreLua(bool client)
             servers += server.second->remote.toStringWithPort();
           }
 
-          ret << (fmt % name % cache % servers) << endl;
+          ret << (fmt % name % cache % policy % servers) << endl;
         }
         g_outputBuffer=ret.str();
       }catch(std::exception& e) { g_outputBuffer=e.what(); throw; }
@@ -683,16 +687,20 @@ void moreLua(bool client)
         }
     });
 
-    g_lua.writeFunction("newPacketCache", [client](size_t maxEntries, boost::optional<uint32_t> maxTTL, boost::optional<uint32_t> minTTL, boost::optional<uint32_t> tempFailTTL, boost::optional<uint32_t> staleTTL) {
-        return std::make_shared<DNSDistPacketCache>(maxEntries, maxTTL ? *maxTTL : 86400, minTTL ? *minTTL : 0, tempFailTTL ? *tempFailTTL : 60, staleTTL ? *staleTTL : 60);
+    g_lua.writeFunction("newPacketCache", [client](size_t maxEntries, boost::optional<uint32_t> maxTTL, boost::optional<uint32_t> minTTL, boost::optional<uint32_t> tempFailTTL, boost::optional<uint32_t> staleTTL, boost::optional<bool> dontAge) {
+        return std::make_shared<DNSDistPacketCache>(maxEntries, maxTTL ? *maxTTL : 86400, minTTL ? *minTTL : 0, tempFailTTL ? *tempFailTTL : 60, staleTTL ? *staleTTL : 60, dontAge ? *dontAge : false);
       });
     g_lua.registerFunction("toString", &DNSDistPacketCache::toString);
     g_lua.registerFunction("isFull", &DNSDistPacketCache::isFull);
     g_lua.registerFunction("purgeExpired", &DNSDistPacketCache::purgeExpired);
     g_lua.registerFunction("expunge", &DNSDistPacketCache::expunge);
-    g_lua.registerFunction<void(std::shared_ptr<DNSDistPacketCache>::*)(const DNSName& dname, boost::optional<uint16_t> qtype)>("expungeByName", [](std::shared_ptr<DNSDistPacketCache> cache, const DNSName& dname, boost::optional<uint16_t> qtype) {
+    g_lua.registerFunction<void(std::shared_ptr<DNSDistPacketCache>::*)(const DNSName& dname, boost::optional<uint16_t> qtype, boost::optional<bool> suffixMatch)>("expungeByName", [](
+                std::shared_ptr<DNSDistPacketCache> cache,
+                const DNSName& dname,
+                boost::optional<uint16_t> qtype,
+                boost::optional<bool> suffixMatch) {
         if (cache) {
-          cache->expungeByName(dname, qtype ? *qtype : QType::ANY);
+          cache->expungeByName(dname, qtype ? *qtype : QType::ANY, suffixMatch ? *suffixMatch : false);
         }
       });
     g_lua.registerFunction<void(std::shared_ptr<DNSDistPacketCache>::*)()>("printStats", [](const std::shared_ptr<DNSDistPacketCache> cache) {
@@ -1164,6 +1172,7 @@ void moreLua(bool client)
 
         DIR *dirp;
         struct dirent *ent;
+        std::list<std::string> files;
         if (!(dirp = opendir(dirname.c_str()))) {
           errlog("Error opening the included directory %s!", dirname.c_str());
           g_outputBuffer="Error opening the included directory " + dirname + "!";
@@ -1183,17 +1192,23 @@ void moreLua(bool client)
               continue;
             }
 
-            std::ifstream ifs(namebuf.str());
-            if (!ifs) {
-              warnlog("Unable to read configuration from '%s'", namebuf.str());
-            } else {
-              vinfolog("Read configuration from '%s'", namebuf.str());
-            }
-
-            g_lua.executeCode(ifs);
+            files.push_back(namebuf.str());
           }
         }
+
         closedir(dirp);
+        files.sort();
+
+        for (auto file = files.begin(); file != files.end(); ++file) {
+          std::ifstream ifs(*file);
+          if (!ifs) {
+            warnlog("Unable to read configuration from '%s'", *file);
+          } else {
+            vinfolog("Read configuration from '%s'", *file);
+          }
+
+          g_lua.executeCode(ifs);
+        }
 
         g_included = false;
     });
@@ -1245,4 +1260,80 @@ void moreLua(bool client)
         g_useTCPSinglePipe = flag;
       });
 
+    g_lua.writeFunction("snmpAgent", [](bool enableTraps, boost::optional<std::string> masterSocket) {
+#ifdef HAVE_NET_SNMP
+        if (g_configurationDone) {
+          errlog("snmpAgent() cannot be used at runtime!");
+          g_outputBuffer="snmpAgent() cannot be used at runtime!\n";
+          return;
+        }
+
+        if (g_snmpEnabled) {
+          errlog("snmpAgent() cannot be used twice!");
+          g_outputBuffer="snmpAgent() cannot be used twice!\n";
+          return;
+        }
+
+        g_snmpEnabled = true;
+        g_snmpTrapsEnabled = enableTraps;
+        g_snmpAgent = new DNSDistSNMPAgent("dnsdist", masterSocket ? *masterSocket : std::string());
+#else
+        errlog("NET SNMP support is required to use snmpAgent()");
+        g_outputBuffer="NET SNMP support is required to use snmpAgent()\n";
+#endif /* HAVE_NET_SNMP */
+      });
+
+    g_lua.writeFunction("SNMPTrapAction", [](boost::optional<std::string> reason) {
+#ifdef HAVE_NET_SNMP
+        return std::shared_ptr<DNSAction>(new SNMPTrapAction(reason ? *reason : ""));
+#else
+        throw std::runtime_error("NET SNMP support is required to use SNMPTrapAction()");
+#endif /* HAVE_NET_SNMP */
+      });
+
+    g_lua.writeFunction("SNMPTrapResponseAction", [](boost::optional<std::string> reason) {
+#ifdef HAVE_NET_SNMP
+        return std::shared_ptr<DNSResponseAction>(new SNMPTrapResponseAction(reason ? *reason : ""));
+#else
+        throw std::runtime_error("NET SNMP support is required to use SNMPTrapResponseAction()");
+#endif /* HAVE_NET_SNMP */
+      });
+
+    g_lua.writeFunction("sendCustomTrap", [](const std::string& str) {
+#ifdef HAVE_NET_SNMP
+        if (g_snmpAgent && g_snmpTrapsEnabled) {
+          g_snmpAgent->sendCustomTrap(str);
+        }
+#endif /* HAVE_NET_SNMP */
+      });
+
+    g_lua.writeFunction("setPoolServerPolicy", [](ServerPolicy policy, string pool) {
+        setLuaSideEffect();
+        auto localPools = g_pools.getCopy();
+        setPoolPolicy(localPools, pool, std::make_shared<ServerPolicy>(policy));
+        g_pools.setState(localPools);
+      });
+
+    g_lua.writeFunction("setPoolServerPolicyLua", [](string name, policyfunc_t policy, string pool) {
+        setLuaSideEffect();
+        auto localPools = g_pools.getCopy();
+        setPoolPolicy(localPools, pool, std::make_shared<ServerPolicy>(ServerPolicy{name, policy}));
+        g_pools.setState(localPools);
+      });
+
+    g_lua.writeFunction("showPoolServerPolicy", [](string pool) {
+        setLuaSideEffect();
+        auto localPools = g_pools.getCopy();
+        auto poolObj = getPool(localPools, pool);
+        if (poolObj->policy == nullptr) {
+          g_outputBuffer=g_policy.getLocal()->name+"\n";
+        } else {
+          g_outputBuffer=poolObj->policy->name+"\n";
+        }
+      });
+
+    g_lua.writeFunction("setTCPDownstreamCleanupInterval", [](uint16_t interval) {
+        setLuaSideEffect();
+        g_downstreamTCPCleanupInterval = interval;
+      });
 }

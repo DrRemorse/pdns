@@ -25,7 +25,7 @@ Replay all recursion-desired DNS questions to a specified IP address.
 Track all outgoing questions, remap id to one of ours.
 Also track all recorded answers, and map them to that same id, the 'expectation'.
 
-When we see a question, parse it, give it a QuestionIdentifyer, and and an id from the free-id list.
+When we see a question, parse it, give it a QuestionIdentifier, and and an id from the free-id list.
 
 When we see an answer in the tcpdump, parse it, make QI, and add it to the original QI
    and check
@@ -709,7 +709,9 @@ try
     ("speedup", po::value<float>()->default_value(1), "replay at this speedup")
     ("timeout-msec", po::value<uint32_t>()->default_value(500), "wait at least this many milliseconds for a reply")
     ("ecs-stamp", "Add original IP address to ECS in replay")
-    ("ecs-mask", po::value<uint16_t>(), "Replace first octet of src IP address with this value in ECS");
+    ("ecs-mask", po::value<uint16_t>(), "Replace first octet of src IP address with this value in ECS")
+    ("source-ip", po::value<string>()->default_value(""), "IP to send the replayed packet from")
+    ("source-port", po::value<uint16_t>()->default_value(0), "Port to send the replayed packet from");
 
   po::options_description alloptions;
   po::options_description hidden("hidden options");
@@ -759,6 +761,10 @@ try
   s_socket= new Socket(AF_INET, SOCK_DGRAM);
 
   s_socket->setNonBlocking();
+
+  if(g_vm.count("source-ip") && !g_vm["source-ip"].as<string>().empty())
+    s_socket->bind(ComboAddress(g_vm["source-ip"].as<string>(), g_vm["source-port"].as<uint16_t>()));
+
   setSocketReceiveBuffer(s_socket->getHandle(), 2000000);
   setSocketSendBuffer(s_socket->getHandle(), 2000000);
 

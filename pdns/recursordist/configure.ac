@@ -94,11 +94,15 @@ AS_IF([test "x$PROTOBUF_LIBS" != "x" -a x"$PROTOC" != "x"],
 BOOST_REQUIRE([$boost_required_version])
 PDNS_SELECT_CONTEXT_IMPL
 
+PDNS_ENABLE_UNIT_TESTS
 PDNS_ENABLE_REPRODUCIBLE
 
 PDNS_WITH_LUAJIT
 AS_IF([test "x$with_luajit" = "xno"], [
   PDNS_WITH_LUA
+])
+AS_IF([test "x$LUAPC" = "x" -a "x$LUAJITPC" = "x"], [
+  AC_MSG_ERROR([Neither Lua nor LuaJIT found, Lua support is not optional])
 ])
 PDNS_CHECK_LUA_HPP
 
@@ -112,6 +116,9 @@ PDNS_CHECK_LIBCRYPTO([
   ]
 )
 PDNS_CHECK_LIBCRYPTO_ECDSA
+PDNS_CHECK_LIBSODIUM
+
+PDNS_WITH_NET_SNMP
 
 # check for tools we might need
 PDNS_CHECK_RAGEL
@@ -201,9 +208,17 @@ AS_IF([test "x$LUAPC" != "x"],
     [AC_MSG_NOTICE([Lua/LuaJit: no])])
 ])
 AC_MSG_NOTICE([OpenSSL ECDSA: $libcrypto_ecdsa])
+AS_IF([test "x$LIBSODIUM_LIBS" != "x"],
+  [AC_MSG_NOTICE([libsodium ed25519: yes])],
+  [AC_MSG_NOTICE([libsodium ed25519: no])]
+)
 AS_IF([test "x$PROTOBUF_LIBS" != "x" -a x"$PROTOC" != "x"],
   [AC_MSG_NOTICE([Protobuf: yes])],
   [AC_MSG_NOTICE([Protobuf: no])]
+)
+AS_IF([test "x$NET_SNMP_LIBS" != "x"],
+  [AC_MSG_NOTICE([SNMP: yes])],
+  [AC_MSG_NOTICE([SNMP: no])]
 )
 AS_IF([test "x$systemd" != "xn"],
   [AC_MSG_NOTICE([systemd: yes])],

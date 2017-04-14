@@ -225,7 +225,7 @@ bool DNSName::isPartOf(const DNSName& parent) const
     if (static_cast<size_t>(distance) == parent.d_storage.size()) {
       auto p = parent.d_storage.cbegin();
       for(; us != d_storage.cend(); ++us, ++p) {
-        if(dns2_tolower(*p) != dns2_tolower(*us))
+        if(dns_tolower(*p) != dns_tolower(*us))
           return false;
       }
       return true;
@@ -328,6 +328,24 @@ vector<string> DNSName::getRawLabels() const
   return ret;
 }
 
+std::string DNSName::getRawLabel(unsigned int pos) const
+{
+  unsigned int currentPos = 0;
+  for(const unsigned char* p = (const unsigned char*) d_storage.c_str(); p < ((const unsigned char*) d_storage.c_str()) + d_storage.size() && *p; p+=*p+1, currentPos++) {
+    if (currentPos == pos) {
+      return std::string((const char*)p+1, (size_t)*p);
+    }
+  }
+
+  throw std::out_of_range("trying to get label at position "+std::to_string(pos)+" of a DNSName that only has "+std::to_string(currentPos)+" labels");
+}
+
+DNSName DNSName::getLastLabel() const
+{
+  DNSName ret(*this);
+  ret.trimToLabels(1);
+  return ret;
+}
 
 bool DNSName::chopOff()
 {
@@ -343,6 +361,16 @@ bool DNSName::isWildcard() const
     return false;
   auto p = d_storage.begin();
   return (*p == 0x01 && *++p == '*');
+}
+
+/*
+ * Returns true if the DNSName is a valid RFC 1123 hostname, this function uses
+ * a regex on the string, so it is probably best not used when speed is essential.
+ */
+bool DNSName::isHostname() const
+{
+  static Regex hostNameRegex = Regex("^(([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)\\.)+$");
+  return hostNameRegex.match(this->toString());
 }
 
 unsigned int DNSName::countLabels() const

@@ -235,13 +235,6 @@ inline bool dns_isspace(char c)
   return c==' ' || c=='\t' || c=='\r' || c=='\n';
 }
 
-inline unsigned char dns_tolower(unsigned char c)
-{
-  if(c>='A' && c<='Z')
-    c+='a'-'A';
-  return c;
-}
-
 inline unsigned char dns_toupper(unsigned char c)
 {
   if(c>='a' && c<='z')
@@ -305,8 +298,9 @@ inline void unixDie(const string &why)
 }
 
 string makeHexDump(const string& str);
-void shuffle(vector<DNSRecord>& rrs);
+struct DNSRecord;
 struct DNSZoneRecord;
+void shuffle(vector<DNSRecord>& rrs);
 void shuffle(vector<DNSZoneRecord>& rrs);
 
 void orderAndShuffle(vector<DNSRecord>& rrs);
@@ -543,7 +537,7 @@ void addCMsgSrcAddr(struct msghdr* msgh, void* cmsgbuf, const ComboAddress* sour
 unsigned int getFilenumLimit(bool hardOrSoft=0);
 void setFilenumLimit(unsigned int lim);
 bool readFileIfThere(const char* fname, std::string* line);
-uint32_t burtle(const unsigned char* k, uint32_t lengh, uint32_t init);
+uint32_t burtle(const unsigned char* k, uint32_t length, uint32_t init);
 bool setSocketTimestamps(int fd);
 
 //! Sets the socket into blocking mode.

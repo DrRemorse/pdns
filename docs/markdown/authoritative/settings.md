@@ -54,16 +54,17 @@ Turning this off requires all supermaster notifications to be signed by valid TS
 ## `allow-recursion`
 * IP ranges, separated by commas
 * Default: 0.0.0.0/0
+* Removed in: 4.1.0
 
 By specifying `allow-recursion`, recursion can be restricted to netmasks
 specified. The default is to allow recursion from everywhere. Example:
 `allow-recursion=198.51.100.0/24, 10.0.0.0/8, 192.0.2.4`.
 
 ## `also-notify`
-* IP adresses, separated by commas
+* IP addresses, separated by commas
 
 When notifying a domain, also notify these nameservers. Example:
-`also-notify=192.0.2.1, 203.0.113.167`. The IP adresses listed in `also-notify`
+`also-notify=192.0.2.1, 203.0.113.167`. The IP addresses listed in `also-notify`
 always receive a notification. Even if they do not match the list in
 [`only-notify`](#also-notify).
 
@@ -94,6 +95,13 @@ Static pre-shared authentication key for access to the REST API.
 * Available since: 4.0
 
 Disallow data modification through the REST API when set.
+
+## `axfr-lower-serial`
+* Boolean
+* Default: no
+* Available since: 4.0.4
+
+Also AXFR a zone from a master with a lower serial.
 
 ## `cache-ttl`
 * Integer
@@ -141,6 +149,9 @@ silently fail over time otherwise (on logrotate).
 When setting `chroot`, all other paths in the config (except for
 [`config-dir`](#config-dir) and [`module-dir`](#module-dir)) set in the configuration
 are relative to the new root.
+
+When running on a system where systemd manages services, `chroot` does not work out of the box, as PowerDNS cannot use the `NOTIFY_SOCKET`.
+Either don't `chroot` on these systems or set the 'Type' of the this service to 'simple' instead of 'notify' (refer to the systemd documentation on how to modify unit-files)
 
 ## `config-dir`
 * Path
@@ -251,7 +262,7 @@ The default keysize for the ZSK generated with
 * Default: no
 
 Read additional ZSKs from the records table/your BIND zonefile. If not set,
-DNSKEY recornds in the zonefiles are ignored.
+DNSKEY records in the zonefiles are ignored.
 
 ## `disable-axfr`
 * Boolean
@@ -331,6 +342,19 @@ Enables EDNS subnet processing, for backends that support it.
 
 Entropy source file to use.
 
+## `expand-alias`
+* Boolean
+* Default: no
+* Since: 4.1.0
+
+If this is enabled, ALIAS records are expanded (synthesised to their A/AAAA).
+
+If this is disabled (the default), ALIAS records will not expanded and the server will will return NODATA for A/AAAA queries for such names.
+
+**note**: [`resolver`](#resolver) must also be set for ALIAS expansion to work!
+
+**note**: In PowerDNS Authoritative Server 4.0.x, this setting did not exist and ALIAS was always expanded.
+
 ## `forward-dnsupdate`
 * Boolean
 * Default: no
@@ -372,7 +396,7 @@ change: e.g. `gmysql-host` is available to configure the `host` setting of the
 first or main instance, and `gmysql-server2-host` for the second one.
 
 ## `load-modules`
-* Paths, seperated by commas
+* Paths, separated by commas
 
 If backends are available in nonstandard directories, specify their location here.
 Multiple files can be loaded if separated by commas. Only available in non-static
@@ -468,8 +492,9 @@ Turn on master support. See ["Modes of operation"](modes-of-operation.md#master-
 * Integer
 * Default: 1000000
 
-Maximum number of cache entries. 1 million (the default) will generally suffice
-for most installations.
+Maximum number of entries in the query cache. 1 million (the default) will generally suffice
+for most installations. Starting with 4.1, the packet and query caches are distinct so you might
+also want to see `max-packet-cache-entries`.
 
 ## `max-ent-entries`
 * Integer
@@ -483,6 +508,14 @@ measure to avoid database explosion due to long names.
 * Default: 500
 
 Limit the number of NSEC3 hash iterations
+
+## `max-packet-cache-entries`
+* Integer
+* Default: 1000000
+
+Maximum number of entries in the packet cache. 1 million (the default) will generally suffice
+for most installations. This setting has been introduced in 4.1, previous used the `max-cache-entries`
+setting for both the packet and query caches.
 
 ## `max-queue-length`
 * Integer
@@ -595,11 +628,11 @@ with [`also-notify`](#also-notify) and `ALSO-NOTIFY` domain metadata always rece
 AXFR NOTIFYs.
 
 Note: Even if NOTIFYs are limited by a netmask, PowerDNS first has to resolve all the
-hostnames to check their IP addresses against the specfied whitelist. The resolving
+hostnames to check their IP addresses against the specified whitelist. The resolving
 may take considerable time, especially if those hostnames are slow to resolve. If you
 do not need to NOTIFY the slaves defined in the NS records (e.g. you are using another
 method to distribute the zone data to the slaves), then set `only-notify` to an empty
-value and specify the notification targets explicitely using [`also-notify`](#also-notify)
+value and specify the notification targets explicitly using [`also-notify`](#also-notify)
 and/or `ALSO-NOTIFY` domain metadata to avoid this potential bottleneck.
 
 ## `out-of-zone-additional-processing`
@@ -681,15 +714,24 @@ Number of receiver (listening) threads to start. See
 ## `recursive-cache-ttl`
 * Integer
 * Default: 10
+* Removed in: 4.1.0
 
 Seconds to store recursive packets in the PacketCache. See
 ["Packet Cache"](performance.md#packet-cache).
 
 ## `recursor`
 * IP Address
+* Removed in: 4.1.0
 
 If set, recursive queries will be handed to the recursor specified here. See
 ["Recursion"](recursion.md).
+
+## `resolver`
+* IP Addresses with optional port, separated by commas
+* Added in: 4.1.0
+
+Use these resolver addresses for ALIAS and the internal stub resolver.
+If this is not set, `/etc/resolv.conf` is parsed for upstream resolvers.
 
 ## `retrieval-threads`
 * Integer
@@ -792,6 +834,14 @@ Limit TCP control to a specific client range.
 * String
 
 Password for TCP control.
+
+## `tcp-fast-open`
+* Integer
+* Default: 0 (Disabled)
+* Available since: 4.1
+
+Enable TCP Fast Open support, if available, on the listening sockets. The numerical
+value supplied is used as the queue size, 0 meaning disabled.
 
 ## `tcp-idle-timeout`
 * Integer

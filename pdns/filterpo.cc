@@ -28,10 +28,8 @@ DNSFilterEngine::DNSFilterEngine()
 {
 }
 
-bool findNamedPolicy(const map<DNSName, DNSFilterEngine::Policy>& polmap, const DNSName& qname, DNSFilterEngine::Policy& pol)
+static bool findNamedPolicy(const std::unordered_map<DNSName, DNSFilterEngine::Policy>& polmap, const DNSName& qname, DNSFilterEngine::Policy& pol)
 {
-  DNSName s(qname);
-
   /* for www.powerdns.com, we need to check:
      www.powerdns.com.
        *.powerdns.com.
@@ -39,14 +37,15 @@ bool findNamedPolicy(const map<DNSName, DNSFilterEngine::Policy>& polmap, const 
                     *.
    */
 
-  map<DNSName, DNSFilterEngine::Policy>::const_iterator iter;
-  iter = polmap.find(s);
+  std::unordered_map<DNSName, DNSFilterEngine::Policy>::const_iterator iter;
+  iter = polmap.find(qname);
 
   if(iter != polmap.end()) {
     pol=iter->second;
     return true;
   }
 
+  DNSName s(qname);
   while(s.chopOff()){
     iter = polmap.find(g_wildcarddnsname+s);
     if(iter != polmap.end()) {
@@ -157,7 +156,19 @@ void DNSFilterEngine::clear(size_t zone)
   z.qpolAddr.clear();
   z.postpolAddr.clear();
   z.propolName.clear();
+  z.propolNSAddr.clear();
   z.qpolName.clear();
+}
+
+void DNSFilterEngine::clear()
+{
+  for(auto& z : d_zones) {
+    z.qpolAddr.clear();
+    z.postpolAddr.clear();
+    z.propolName.clear();
+    z.propolNSAddr.clear();
+    z.qpolName.clear();
+  }
 }
 
 void DNSFilterEngine::addClientTrigger(const Netmask& nm, Policy pol, size_t zone)

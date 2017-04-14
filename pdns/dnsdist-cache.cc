@@ -24,17 +24,21 @@
 #include "dnsparser.hh"
 #include "dnsdist-cache.hh"
 
-DNSDistPacketCache::DNSDistPacketCache(size_t maxEntries, uint32_t maxTTL, uint32_t minTTL, uint32_t tempFailureTTL, uint32_t staleTTL): d_maxEntries(maxEntries), d_maxTTL(maxTTL), d_tempFailureTTL(tempFailureTTL), d_minTTL(minTTL), d_staleTTL(staleTTL)
+DNSDistPacketCache::DNSDistPacketCache(size_t maxEntries, uint32_t maxTTL, uint32_t minTTL, uint32_t tempFailureTTL, uint32_t staleTTL, bool dontAge): d_maxEntries(maxEntries), d_maxTTL(maxTTL), d_tempFailureTTL(tempFailureTTL), d_minTTL(minTTL), d_staleTTL(staleTTL), d_dontAge(dontAge)
 {
   pthread_rwlock_init(&d_lock, 0);
-  /* we reserve maxEntries + 1 to avoid rehashing from occuring
+  /* we reserve maxEntries + 1 to avoid rehashing from occurring
      when we get to maxEntries, as it means a load factor of 1 */
   d_map.reserve(maxEntries + 1);
 }
 
 DNSDistPacketCache::~DNSDistPacketCache()
 {
-  WriteLock l(&d_lock);
+  try {
+    WriteLock l(&d_lock);
+  }
+  catch(const PDNSException& pe) {
+  }
 }
 
 bool DNSDistPacketCache::cachedValueMatches(const CacheValue& cachedValue, const DNSName& qname, uint16_t qtype, uint16_t qclass, bool tcp)
@@ -53,11 +57,21 @@ void DNSDistPacketCache::insert(uint32_t key, const DNSName& qname, uint16_t qty
 
   if (rcode == RCode::ServFail || rcode == RCode::Refused) {
     minTTL = d_tempFailureTTL;
+    if (minTTL == 0) {
+      return;
+    }
   }
   else {
     minTTL = getMinTTL(response, responseLen);
-    if (minTTL > d_maxTTL)
+
+    /* no TTL found, we don't want to cache this */
+    if (minTTL == std::numeric_limits<uint32_t>::max()) {
+      return;
+    }
+
+    if (minTTL > d_maxTTL) {
       minTTL = d_maxTTL;
+    }
 
     if (minTTL < d_minTTL) {
       d_ttlTooShorts++;
@@ -195,7 +209,7 @@ bool DNSDistPacketCache::get(const DNSQuestion& dq, uint16_t consumed, uint16_t 
     }
   }
 
-  if (!skipAging) {
+  if (!d_dontAge && !skipAging) {
     ageDNSPacket(response, *responseLen, age);
   }
 
@@ -244,18 +258,15 @@ void DNSDistPacketCache::expunge(size_t upTo)
   d_map.erase(beginIt, endIt);
 }
 
-void DNSDistPacketCache::expungeByName(const DNSName& name, uint16_t qtype)
+void DNSDistPacketCache::expungeByName(const DNSName& name, uint16_t qtype, bool suffixMatch)
 {
   WriteLock w(&d_lock);
 
   for(auto it = d_map.begin(); it != d_map.end(); ) {
     const CacheValue& value = it->second;
-    uint16_t cqtype = 0;
-    uint16_t cqclass = 0;
-    DNSName cqname(value.value.c_str(), value.len, sizeof(dnsheader), false, &cqtype, &cqclass, nullptr);
 
-    if (cqname == name && (qtype == QType::ANY || qtype == cqtype)) {
-        it = d_map.erase(it);
+    if ((value.qname == name || (suffixMatch && value.qname.isPartOf(name))) && (qtype == QType::ANY || qtype == value.qtype)) {
+      it = d_map.erase(it);
     } else {
       ++it;
     }

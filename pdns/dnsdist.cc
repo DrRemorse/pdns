@@ -89,6 +89,10 @@ std::vector<std::shared_ptr<DynBPFFilter> > g_dynBPFFilters;
 vector<ClientState *> g_frontends;
 GlobalStateHolder<pools_t> g_pools;
 
+bool g_snmpEnabled{false};
+bool g_snmpTrapsEnabled{false};
+DNSDistSNMPAgent* g_snmpAgent{nullptr};
+
 /* UDP: the grand design. Per socket we listen on for incoming queries there is one thread.
    Then we have a bunch of connected sockets for talking to downstream servers. 
    We send directly to those sockets.
@@ -600,7 +604,7 @@ shared_ptr<DownstreamState> valrandom(unsigned int val, const NumberedServerVect
     return shared_ptr<DownstreamState>();
 
   int r = val % sum;
-  auto p = upper_bound(poss.begin(), poss.end(),r, [](int r, const decltype(poss)::value_type& a) { return  r < a.first;});
+  auto p = upper_bound(poss.begin(), poss.end(),r, [](int r_, const decltype(poss)::value_type& a) { return  r_ < a.first;});
   if(p==poss.end())
     return shared_ptr<DownstreamState>();
   return p->second;
@@ -693,6 +697,17 @@ std::shared_ptr<ServerPool> createPoolIfNotExists(pools_t& pools, const string& 
   return pool;
 }
 
+void setPoolPolicy(pools_t& pools, const string& poolName, std::shared_ptr<ServerPolicy> policy)
+{
+  std::shared_ptr<ServerPool> pool = createPoolIfNotExists(pools, poolName);
+  if (!poolName.empty()) {
+    vinfolog("Setting pool %s server selection policy to %s", poolName, policy->name);
+  } else {
+    vinfolog("Setting default pool server selection policy to %s", policy->name);
+  }
+  pool->policy = policy;
+}
+
 void addServerToPool(pools_t& pools, const string& poolName, std::shared_ptr<DownstreamState> server)
 {
   std::shared_ptr<ServerPool> pool = createPoolIfNotExists(pools, poolName);
@@ -709,8 +724,8 @@ void addServerToPool(pools_t& pools, const string& poolName, std::shared_ptr<Dow
     });
   /* and now we need to renumber for Lua (custom policies) */
   size_t idx = 1;
-  for (auto& server : pool->servers) {
-    server.first = idx++;
+  for (auto& serv : pool->servers) {
+    serv.first = idx++;
   }
 }
 
@@ -1057,7 +1072,11 @@ try
 
       uint16_t len = (uint16_t) ret;
       ComboAddress dest;
-      if (!HarvestDestinationAddress(&msgh, &dest)) {
+      if (HarvestDestinationAddress(&msgh, &dest)) {
+        /* we don't get the port, only the address */
+        dest.sin4.sin_port = cs->local.sin4.sin_port;
+      }
+      else {
         dest.sin4.sin_family = 0;
       }
 
@@ -1133,7 +1152,7 @@ try
             continue;
           }
 #endif
-          sendUDPResponse(cs->udpFD, response, responseLen, 0, dest, remote);
+          sendUDPResponse(cs->udpFD, response, responseLen, delayMsec, dest, remote);
         }
 
         continue;
@@ -1142,11 +1161,14 @@ try
       DownstreamState* ss = nullptr;
       std::shared_ptr<ServerPool> serverPool = getPool(*localPools, poolname);
       std::shared_ptr<DNSDistPacketCache> packetCache = nullptr;
-      auto policy=localPolicy->policy;
+      auto policy = localPolicy->policy;
+      if (serverPool->policy != nullptr) {
+        policy = serverPool->policy->policy;
+      }
       {
-	std::lock_guard<std::mutex> lock(g_luamutex);
-	ss = policy(serverPool->servers, &dq).get();
-	packetCache = serverPool->packetCache;
+        std::lock_guard<std::mutex> lock(g_luamutex);
+        ss = policy(serverPool->servers, &dq).get();
+        packetCache = serverPool->packetCache;
       }
 
       bool ednsAdded = false;
@@ -1175,7 +1197,7 @@ try
               continue;
             }
 #endif
-            sendUDPResponse(cs->udpFD, cachedResponse, cachedResponseSize, 0, dest, remote);
+            sendUDPResponse(cs->udpFD, cachedResponse, cachedResponseSize, delayMsec, dest, remote);
           }
 
           g_stats.cacheHits++;
@@ -1484,6 +1506,9 @@ void* healthChecksThread()
 
           dss->upStatus = newState;
           dss->currentCheckFailures = 0;
+          if (g_snmpAgent && g_snmpTrapsEnabled) {
+            g_snmpAgent->sendBackendStatusChangeTrap(dss);
+          }
         }
       }
 
@@ -1606,7 +1631,7 @@ static void checkFileDescriptorsLimits(size_t udpBindsCount, size_t tcpBindsCoun
   requiredFDsCount += tcpBindsCount;
   /* max TCP connections currently served */
   requiredFDsCount += g_maxTCPClientThreads;
-  /* max pipes for communicatin between TCP acceptors and client threads */
+  /* max pipes for communicating between TCP acceptors and client threads */
   requiredFDsCount += (g_maxTCPClientThreads * 2);
   /* UDP sockets to backends */
   requiredFDsCount += backendsCount;
@@ -1649,9 +1674,6 @@ struct
   string pidfile;
   string command;
   string config;
-#ifdef HAVE_LIBSODIUM
-  string setKey;
-#endif
   string uid;
   string gid;
 } g_cmdLine;
@@ -1783,7 +1805,7 @@ try
       break;
 #ifdef HAVE_LIBSODIUM
     case 'k':
-      if (B64Decode(string(optarg), g_cmdLine.setKey) < 0) {
+      if (B64Decode(string(optarg), g_key) < 0) {
         cerr<<"Unable to decode key '"<<optarg<<"'."<<endl;
         exit(EXIT_FAILURE);
       }
@@ -1849,10 +1871,6 @@ try
     setupLua(true, g_cmdLine.config);
     if (clientAddress != ComboAddress())
       g_serverControl = clientAddress;
-#ifdef HAVE_LIBSODIUM
-    if (!g_cmdLine.setKey.empty())
-      g_key = g_cmdLine.setKey;
-#endif
     doClient(g_serverControl, g_cmdLine.command);
     _exit(EXIT_SUCCESS);
   }
@@ -1881,7 +1899,6 @@ try
   
   if(g_locals.empty())
     g_locals.push_back(std::make_tuple(ComboAddress("127.0.0.1", 53), true, false, 0));
-  
 
   g_configurationDone = true;
 
@@ -2085,6 +2102,10 @@ try
   /* this need to be done _after_ dropping privileges */
   g_delay = new DelayPipe<DelayedPacket>();
 
+  if (g_snmpAgent) {
+    g_snmpAgent->run();
+  }
+
   g_tcpclientthreads = std::make_shared<TCPClientCollection>(g_maxTCPClientThreads, g_useTCPSinglePipe);
 
   for(auto& t : todo)
@@ -2151,6 +2172,19 @@ try
   }
   _exit(EXIT_SUCCESS);
 
+}
+catch(const LuaContext::ExecutionErrorException& e) {
+  try {
+    errlog("Fatal Lua error: %s", e.what());
+    std::rethrow_if_nested(e);
+  } catch(const std::exception& e) {
+    errlog("Details: %s", e.what());
+  }
+  catch(PDNSException &ae)
+  {
+    errlog("Fatal pdns error: %s", ae.reason);
+  }
+  _exit(EXIT_FAILURE);
 }
 catch(std::exception &e)
 {
