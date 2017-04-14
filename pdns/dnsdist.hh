@@ -153,6 +153,10 @@ struct StopWatch
       unixDie("Getting timestamp");
     
   }
+
+  void set(const struct timespec& from) {
+    d_start = from;
+  }
   
   double udiff() const {
     struct timespec now;
@@ -233,6 +237,8 @@ private:
   mutable unsigned int d_blocked{0};
 };
 
+struct ClientState;
+
 struct IDState
 {
   IDState() : origFD(-1), sentTime(true), delayMsec(0) { origDest.sin4.sin_family = 0;}
@@ -259,6 +265,7 @@ struct IDState
   boost::uuids::uuid uniqueId;
 #endif
   std::shared_ptr<DNSDistPacketCache> packetCache{nullptr};
+  const ClientState* cs{nullptr};
   uint32_t cacheKey;                                          // 8
   std::atomic<uint16_t> age;                                  // 4
   uint16_t qtype;                                             // 2
@@ -273,10 +280,10 @@ struct IDState
 };
 
 struct Rings {
-  Rings()
+  Rings(size_t capacity=10000)
   {
-    queryRing.set_capacity(10000);
-    respRing.set_capacity(10000);
+    queryRing.set_capacity(capacity);
+    respRing.set_capacity(capacity);
     pthread_rwlock_init(&queryLock, 0);
   }
   struct Query
@@ -306,6 +313,17 @@ struct Rings {
 
   std::unordered_map<int, vector<boost::variant<string,double> > > getTopBandwidth(unsigned int numentries);
   size_t numDistinctRequestors();
+  void setCapacity(size_t newCapacity) 
+  {
+    {
+      WriteLock wl(&queryLock);
+      queryRing.set_capacity(newCapacity);
+    }
+    {
+      std::lock_guard<std::mutex> lock(respMutex);
+      respRing.set_capacity(newCapacity);
+    }
+  }
 };
 
 extern Rings g_rings;
@@ -334,6 +352,7 @@ struct ClientState
   std::atomic<uint64_t> queries{0};
   int udpFD{-1};
   int tcpFD{-1};
+  bool muted{false};
 
   int getSocket() const
   {
@@ -368,12 +387,26 @@ class TCPClientCollection {
   std::atomic<uint64_t> d_queued{0};
   uint64_t d_maxthreads{0};
   std::mutex d_mutex;
+  int d_singlePipe[2];
+  bool d_useSinglePipe;
 public:
 
-  TCPClientCollection(size_t maxThreads)
+  TCPClientCollection(size_t maxThreads, bool useSinglePipe=false): d_maxthreads(maxThreads), d_singlePipe{-1,-1}, d_useSinglePipe(useSinglePipe)
+
   {
-    d_maxthreads = maxThreads;
     d_tcpclientthreads.reserve(maxThreads);
+
+    if (d_useSinglePipe) {
+      if (pipe(d_singlePipe) < 0) {
+        throw std::runtime_error("Error creating the TCP single communication pipe: " + string(strerror(errno)));
+      }
+      if (!setNonBlocking(d_singlePipe[1])) {
+        int err = errno;
+        close(d_singlePipe[0]);
+        close(d_singlePipe[1]);
+        throw std::runtime_error("Error setting the TCP single communication pipe non-blocking: " + string(strerror(err)));
+      }
+    }
   }
   int getThread()
   {
@@ -436,6 +469,7 @@ struct DownstreamState
   double latencyUsec{0.0};
   int order{1};
   int weight{1};
+  int tcpConnectTimeout{5};
   int tcpRecvTimeout{30};
   int tcpSendTimeout{30};
   unsigned int sourceItf{0};
@@ -449,6 +483,7 @@ struct DownstreamState
   bool upStatus{false};
   bool useECS{false};
   bool setCD{false};
+  std::atomic<bool> connected{false};
   bool isUp() const
   {
     if(availability == Availability::Down)
@@ -472,7 +507,7 @@ struct DownstreamState
     }
     return name + " (" + remote.toStringWithPort()+ ")";
   }
-
+  void reconnect();
 };
 using servers_t =vector<std::shared_ptr<DownstreamState>>;
 
@@ -595,6 +630,7 @@ extern GlobalStateHolder<servers_t> g_dstates;
 extern GlobalStateHolder<pools_t> g_pools;
 extern GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSAction> > > > g_rulactions;
 extern GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSResponseAction> > > > g_resprulactions;
+extern GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSResponseAction> > > > g_cachehitresprulactions;
 extern GlobalStateHolder<NetmaskGroup> g_ACL;
 
 extern ComboAddress g_serverControl; // not changed during runtime
@@ -611,6 +647,9 @@ extern uint16_t g_maxOutstanding;
 extern std::atomic<bool> g_configurationDone;
 extern uint64_t g_maxTCPClientThreads;
 extern uint64_t g_maxTCPQueuedConnections;
+extern size_t g_maxTCPQueriesPerConn;
+extern size_t g_maxTCPConnectionDuration;
+extern size_t g_maxTCPConnectionsPerClient;
 extern std::atomic<uint16_t> g_cacheCleaningDelay;
 extern std::atomic<uint16_t> g_cacheCleaningPercentage;
 extern bool g_verboseHealthChecks;
@@ -618,6 +657,8 @@ extern uint32_t g_staleCacheEntriesTTL;
 extern bool g_apiReadWrite;
 extern std::string g_apiConfigDirectory;
 extern bool g_servFailOnNoPolicy;
+extern uint32_t g_hashperturb;
+extern bool g_useTCPSinglePipe;
 
 struct ConsoleKeyword {
   std::string name;

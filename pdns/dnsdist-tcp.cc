@@ -47,24 +47,34 @@ using std::atomic;
    Let's start naively.
 */
 
-static int setupTCPDownstream(shared_ptr<DownstreamState> ds)
-{  
-  vinfolog("TCP connecting to downstream %s", ds->remote.toStringWithPort());
-  int sock = SSocket(ds->remote.sin4.sin_family, SOCK_STREAM, 0);
-  try {
-    if (!IsAnyAddress(ds->sourceAddr)) {
-      SSetsockopt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
-      SBind(sock, ds->sourceAddr);
+static int setupTCPDownstream(shared_ptr<DownstreamState> ds, uint16_t& downstreamFailures)
+{
+  do {
+    vinfolog("TCP connecting to downstream %s (%d)", ds->remote.toStringWithPort(), downstreamFailures);
+    int sock = SSocket(ds->remote.sin4.sin_family, SOCK_STREAM, 0);
+    try {
+      if (!IsAnyAddress(ds->sourceAddr)) {
+        SSetsockopt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+#ifdef IP_BIND_ADDRESS_NO_PORT
+        SSetsockopt(sock, SOL_IP, IP_BIND_ADDRESS_NO_PORT, 1);
+#endif
+        SBind(sock, ds->sourceAddr);
+      }
+      setNonBlocking(sock);
+      SConnectWithTimeout(sock, ds->remote, ds->tcpConnectTimeout);
+      return sock;
     }
-    SConnect(sock, ds->remote);
-    setNonBlocking(sock);
-  }
-  catch(const std::runtime_error& e) {
-    /* don't leak our file descriptor if SConnect() (for example) throws */
-    close(sock);
-    throw;
-  }
-  return sock;
+    catch(const std::runtime_error& e) {
+      /* don't leak our file descriptor if SConnect() (for example) throws */
+      downstreamFailures++;
+      close(sock);
+      if (downstreamFailures > ds->retries) {
+        throw;
+      }
+    }
+  } while(downstreamFailures <= ds->retries);
+
+  return -1;
 }
 
 struct ConnectionInfo
@@ -75,23 +85,48 @@ struct ConnectionInfo
 };
 
 uint64_t g_maxTCPQueuedConnections{1000};
+size_t g_maxTCPQueriesPerConn{0};
+size_t g_maxTCPConnectionDuration{0};
+size_t g_maxTCPConnectionsPerClient{0};
+static std::mutex tcpClientsCountMutex;
+static std::map<ComboAddress,size_t,ComboAddress::addressOnlyLessThan> tcpClientsCount;
+bool g_useTCPSinglePipe{false};
+
 void* tcpClientThread(int pipefd);
+
+static void decrementTCPClientCount(const ComboAddress& client)
+{
+  if (g_maxTCPConnectionsPerClient) {
+    std::lock_guard<std::mutex> lock(tcpClientsCountMutex);
+    tcpClientsCount[client]--;
+    if (tcpClientsCount[client] == 0) {
+      tcpClientsCount.erase(client);
+    }
+  }
+}
 
 void TCPClientCollection::addTCPClientThread()
 {
+  int pipefds[2] = { -1, -1};
+
   vinfolog("Adding TCP Client thread");
 
-  int pipefds[2] = { -1, -1};
-  if (pipe(pipefds) < 0) {
-    errlog("Error creating the TCP thread communication pipe: %s", strerror(errno));
-    return;
+  if (d_useSinglePipe) {
+    pipefds[0] = d_singlePipe[0];
+    pipefds[1] = d_singlePipe[1];
   }
+  else {
+    if (pipe(pipefds) < 0) {
+      errlog("Error creating the TCP thread communication pipe: %s", strerror(errno));
+      return;
+    }
 
-  if (!setNonBlocking(pipefds[1])) {
-    close(pipefds[0]);
-    close(pipefds[1]);
-    errlog("Error setting the TCP thread communication pipe non-blocking: %s", strerror(errno));
-    return;
+    if (!setNonBlocking(pipefds[1])) {
+      close(pipefds[0]);
+      close(pipefds[1]);
+      errlog("Error setting the TCP thread communication pipe non-blocking: %s", strerror(errno));
+      return;
+    }
   }
 
   {
@@ -99,8 +134,10 @@ void TCPClientCollection::addTCPClientThread()
 
     if (d_numthreads >= d_tcpclientthreads.capacity()) {
       warnlog("Adding a new TCP client thread would exceed the vector capacity (%d/%d), skipping", d_numthreads.load(), d_tcpclientthreads.capacity());
-      close(pipefds[0]);
-      close(pipefds[1]);
+      if (!d_useSinglePipe) {
+        close(pipefds[0]);
+        close(pipefds[1]);
+      }
       return;
     }
 
@@ -111,8 +148,10 @@ void TCPClientCollection::addTCPClientThread()
     catch(const std::runtime_error& e) {
       /* the thread creation failed, don't leak */
       errlog("Error creating a TCP thread: %s", e.what());
-      close(pipefds[0]);
-      close(pipefds[1]);
+      if (!d_useSinglePipe) {
+        close(pipefds[0]);
+        close(pipefds[1]);
+      }
       return;
     }
 
@@ -170,6 +209,18 @@ static bool sendResponseToClient(int fd, const char* response, uint16_t response
   return true;
 }
 
+static bool maxConnectionDurationReached(unsigned int maxConnectionDuration, time_t start, unsigned int& remainingTime)
+{
+  if (maxConnectionDuration) {
+    time_t elapsed = time(NULL) - start;
+    if (elapsed >= maxConnectionDuration) {
+      return true;
+    }
+    remainingTime = maxConnectionDuration - elapsed;
+  }
+  return false;
+}
+
 std::shared_ptr<TCPClientCollection> g_tcpclientthreads;
 
 void* tcpClientThread(int pipefd)
@@ -190,6 +241,7 @@ void* tcpClientThread(int pipefd)
   auto localPolicy = g_policy.getLocal();
   auto localRulactions = g_rulactions.getLocal();
   auto localRespRulactions = g_resprulactions.getLocal();
+  auto localCacheHitRespRulactions = g_cachehitresprulactions.getLocal();
   auto localDynBlockNMG = g_dynblockNMG.getLocal();
   auto localDynBlockSMT = g_dynblockSMT.getLocal();
   auto localPools = g_pools.getLocal();
@@ -220,6 +272,9 @@ void* tcpClientThread(int pipefd)
     memset(&dest, 0, sizeof(dest));
     dest.sin4.sin_family = ci.remote.sin4.sin_family;
     socklen_t len = dest.getSocklen();
+    size_t queriesCount = 0;
+    time_t connectionStartTime = time(NULL);
+
     if (!setNonBlocking(ci.fd))
       goto drop;
 
@@ -229,6 +284,7 @@ void* tcpClientThread(int pipefd)
 
     try {
       for(;;) {
+        unsigned int remainingTime = 0;
         ds = nullptr;
         outstanding = false;
 
@@ -237,6 +293,18 @@ void* tcpClientThread(int pipefd)
 
         ci.cs->queries++;
         g_stats.queries++;
+
+        queriesCount++;
+
+        if (g_maxTCPQueriesPerConn && queriesCount > g_maxTCPQueriesPerConn) {
+          vinfolog("Terminating TCP connection from %s because it reached the maximum number of queries per conn (%d / %d)", ci.remote.toStringWithPort(), queriesCount, g_maxTCPQueriesPerConn);
+          break;
+        }
+
+        if (maxConnectionDurationReached(g_maxTCPConnectionDuration, connectionStartTime, remainingTime)) {
+          vinfolog("Terminating TCP connection from %s because it reached the maximum TCP connection duration", ci.remote.toStringWithPort());
+          break;
+        }
 
         if (qlen < sizeof(dnsheader)) {
           g_stats.nonCompliantQueries++;
@@ -251,7 +319,7 @@ void* tcpClientThread(int pipefd)
         size_t querySize = qlen <= 4096 ? qlen + 512 : qlen;
         char queryBuffer[querySize];
         const char* query = queryBuffer;
-        readn2WithTimeout(ci.fd, queryBuffer, qlen, g_tcpRecvTimeout);
+        readn2WithTimeout(ci.fd, queryBuffer, qlen, g_tcpRecvTimeout, remainingTime);
 
 #ifdef HAVE_DNSCRYPT
         std::shared_ptr<DnsCryptQuery> dnsCryptQuery = 0;
@@ -347,6 +415,14 @@ void* tcpClientThread(int pipefd)
           uint16_t cachedResponseSize = sizeof cachedResponse;
           uint32_t allowExpired = ds ? 0 : g_staleCacheEntriesTTL;
           if (packetCache->get(dq, (uint16_t) consumed, dq.dh->id, cachedResponse, &cachedResponseSize, &cacheKey, allowExpired)) {
+            DNSResponse dr(dq.qname, dq.qtype, dq.qclass, dq.local, dq.remote, (dnsheader*) cachedResponse, sizeof cachedResponse, cachedResponseSize, true, &queryRealTime);
+#ifdef HAVE_PROTOBUF
+            dr.uniqueId = dq.uniqueId;
+#endif
+            if (!processResponse(localCacheHitRespRulactions, dr, &delayMsec)) {
+              goto drop;
+            }
+
 #ifdef HAVE_DNSCRYPT
             if (!encryptResponse(cachedResponse, &cachedResponseSize, sizeof cachedResponse, true, dnsCryptQuery)) {
               goto drop;
@@ -379,8 +455,9 @@ void* tcpClientThread(int pipefd)
         }
 
 	int dsock = -1;
+	uint16_t downstreamFailures=0;
 	if(sockets.count(ds->remote) == 0) {
-	  dsock=setupTCPDownstream(ds);
+	  dsock=setupTCPDownstream(ds, downstreamFailures);
 	  sockets[ds->remote]=dsock;
 	}
 	else
@@ -390,15 +467,14 @@ void* tcpClientThread(int pipefd)
         ds->outstanding++;
         outstanding = true;
 
-        uint16_t downstream_failures=0;
       retry:; 
         if (dsock < 0) {
           sockets.erase(ds->remote);
           break;
         }
 
-        if (ds->retries > 0 && downstream_failures > ds->retries) {
-          vinfolog("Downstream connection to %s failed %d times in a row, giving up.", ds->getName(), downstream_failures);
+        if (ds->retries > 0 && downstreamFailures > ds->retries) {
+          vinfolog("Downstream connection to %s failed %d times in a row, giving up.", ds->getName(), downstreamFailures);
           close(dsock);
           dsock=-1;
           sockets.erase(ds->remote);
@@ -410,9 +486,9 @@ void* tcpClientThread(int pipefd)
           close(dsock);
           dsock=-1;
           sockets.erase(ds->remote);
-          dsock=setupTCPDownstream(ds);
+          downstreamFailures++;
+          dsock=setupTCPDownstream(ds, downstreamFailures);
           sockets[ds->remote]=dsock;
-          downstream_failures++;
           goto retry;
         }
 
@@ -429,9 +505,9 @@ void* tcpClientThread(int pipefd)
           close(dsock);
           dsock=-1;
           sockets.erase(ds->remote);
-          dsock=setupTCPDownstream(ds);
+          downstreamFailures++;
+          dsock=setupTCPDownstream(ds, downstreamFailures);
           sockets[ds->remote]=dsock;
-          downstream_failures++;
           goto retry;
         }
 
@@ -448,9 +524,9 @@ void* tcpClientThread(int pipefd)
           close(dsock);
           dsock=-1;
           sockets.erase(ds->remote);
-          dsock=setupTCPDownstream(ds);
+          downstreamFailures++;
+          dsock=setupTCPDownstream(ds, downstreamFailures);
           sockets[ds->remote]=dsock;
-          downstream_failures++;
           if(xfrStarted) {
             goto drop;
           }
@@ -545,10 +621,10 @@ void* tcpClientThread(int pipefd)
       outstanding = false;
       --ds->outstanding;
     }
+    decrementTCPClientCount(ci.remote);
   }
   return 0;
 }
-
 
 /* spawn as many of these as required, they call Accept on a socket on which they will accept queries, and 
    they will hand off to worker threads & spawn more of them if required
@@ -556,7 +632,7 @@ void* tcpClientThread(int pipefd)
 void* tcpAcceptorThread(void* p)
 {
   ClientState* cs = (ClientState*) p;
-
+  bool tcpClientCountIncremented = false;
   ComboAddress remote;
   remote.sin4.sin_family = cs->local.sin4.sin_family;
   
@@ -566,6 +642,7 @@ void* tcpAcceptorThread(void* p)
   for(;;) {
     bool queuedCounterIncremented = false;
     ConnectionInfo* ci = nullptr;
+    tcpClientCountIncremented = false;
     try {
       ci = new ConnectionInfo;
       ci->cs = cs;
@@ -589,8 +666,22 @@ void* tcpAcceptorThread(void* p)
         continue;
       }
 
+      if (g_maxTCPConnectionsPerClient) {
+        std::lock_guard<std::mutex> lock(tcpClientsCountMutex);
+
+        if (tcpClientsCount[remote] >= g_maxTCPConnectionsPerClient) {
+          close(ci->fd);
+          delete ci;
+          ci=nullptr;
+          vinfolog("Dropping TCP connection from %s because we have too many from this client already", remote.toStringWithPort());
+          continue;
+        }
+        tcpClientsCount[remote]++;
+        tcpClientCountIncremented = true;
+      }
+
       vinfolog("Got TCP connection from %s", remote.toStringWithPort());
-      
+
       ci->remote = remote;
       int pipe = g_tcpclientthreads->getThread();
       if (pipe >= 0) {
@@ -603,12 +694,18 @@ void* tcpAcceptorThread(void* p)
         close(ci->fd);
         delete ci;
         ci=nullptr;
+        if(tcpClientCountIncremented) {
+          decrementTCPClientCount(remote);
+        }
       }
     }
     catch(std::exception& e) {
       errlog("While reading a TCP question: %s", e.what());
       if(ci && ci->fd >= 0) 
 	close(ci->fd);
+      if(tcpClientCountIncremented) {
+        decrementTCPClientCount(remote);
+      }
       delete ci;
       ci = nullptr;
       if (queuedCounterIncremented) {

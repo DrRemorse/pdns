@@ -147,7 +147,7 @@ vstringtok (Container &container, string const &in,
 size_t writen2(int fd, const void *buf, size_t count);
 inline size_t writen2(int fd, const std::string &s) { return writen2(fd, s.data(), s.size()); }
 size_t readn2(int fd, void* buffer, size_t len);
-size_t readn2WithTimeout(int fd, void* buffer, size_t len, int timeout);
+size_t readn2WithTimeout(int fd, void* buffer, size_t len, int idleTimeout, int totalTimeout=0);
 size_t writen2WithTimeout(int fd, const void * buffer, size_t len, int timeout);
 
 const string toLower(const string &upper);
@@ -373,7 +373,8 @@ inline bool pdns_iequals_ch(const char a, const char b)
 }
 
 
-typedef std::atomic<unsigned long> AtomicCounter ;
+typedef unsigned long AtomicCounterInner;
+typedef std::atomic<AtomicCounterInner> AtomicCounter ;
 
 // FIXME400 this should probably go? 
 struct CIStringCompare: public std::binary_function<string, string, bool>
@@ -611,3 +612,4 @@ uid_t strToUID(const string &str);
 gid_t strToGID(const string &str);
 
 unsigned int pdns_stou(const std::string& str, size_t * idx = 0, int base = 10);
+

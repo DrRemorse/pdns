@@ -191,10 +191,11 @@ or if the answer can't be sent in less than 2s. This can be configured with:
 
 The same kind of timeouts is enforced on the TCP connections to the downstream servers.
 The default value of 30s can be modified by passing the `tcpRecvTimeout` and `tcpSendTimeout`
-parameters to `newServer`. If the TCP connection to a downstream server fails, `dnsdist`
+parameters to `newServer`, with an additional `tcpConnectTimeout` parameter controlling
+the connection timeout (5s by default). If the TCP connection to a downstream server fails, `dnsdist`
 will try to establish a new one up to `retries` times before giving up.
 ```
-newServer({address="192.0.2.1", tcpRecvTimeout=10, tcpSendTimeout=10, retries=5})
+newServer({address="192.0.2.1", tcpConnectTimeout=5, tcpRecvTimeout=10, tcpSendTimeout=10, retries=5})
 ```
 
 Source address
@@ -347,6 +348,7 @@ Rules have selectors and actions. Current selectors are:
  * RE2Rule on query name (optional)
  * Response code
  * Packet requests DNSSEC processing
+ * Packet requests recursion
  * Query received over UDP or TCP
  * Opcode (OpcodeRule)
  * Number of entries in a given section (RecordsCountRule)
@@ -400,11 +402,17 @@ Rules can be added via:
 Response rules can be added via:
 
  * addResponseAction(DNS rule, DNS Response Action)
+ * AddLuaResponseAction(DNS rule, Lua function)
+
+Cache Hit Response rules, triggered on a cache hit, can be added via:
+
+ * addCacheHitResponseAction(DNS rule, DNS Response Action)
 
 A DNS rule can be:
 
  * an AllRule
  * an AndRule
+ * a DNSSECRule
  * a MaxQPSIPRule
  * a MaxQPSRule
  * a NetmaskGroupRule
@@ -416,6 +424,7 @@ A DNS rule can be:
  * a QNameWireLengthRule
  * a QTypeRule
  * a RCodeRule
+ * a RDRule
  * a RegexRule
  * a RE2Rule
  * a RecordsCountRule
@@ -572,6 +581,8 @@ Valid return values for `LuaAction` functions are:
  * DNSAction.Pool: use the specified pool to forward this query
  * DNSAction.Refused: return a response with a Refused rcode
  * DNSAction.Spoof: spoof the response using the supplied IPv4 (A), IPv6 (AAAA) or string (CNAME) value
+
+The same feature exists to hand off some responses for Lua inspection, using `addLuaResponseAction(x, func)`.
 
 DNSSEC
 ------
@@ -940,6 +951,14 @@ they wait to be picked up. The maximum number of queued connections
 can be configured with `setMaxTCPQueuedConnections()` and defaults to 1000.
 Any value larger than 0 will cause new connections to be dropped if there are
 already too many queued.
+By default, every TCP worker thread has its own queue, and the incoming TCP
+connections are dispatched to TCP workers on a round-robin basis. This might
+cause issues if some connections are taking a very long time, since incoming
+ones will be waiting until the TCP worker they have been assigned to has finished
+handling its current query, while other TCP workers might be available.
+The experimental `setTCPUseSinglePipe(true)` directive can be used so that all the
+incoming TCP connections are put into a single queue and handled by the
+first TCP worker available.
 
 When dispatching UDP queries to backend servers, `dnsdist` keeps track of at
 most `n` outstanding queries for each backend. This number `n` can be tuned by
@@ -1249,6 +1268,7 @@ Here are all functions:
     * function `getBind(n)`: return the corresponding `ClientState` object
     * member `attachFilter(BPFFilter)`: attach a BPF Filter to this bind
     * member `detachFilter()`: detach the BPF Filter attached to this bind, if any
+    * member `muted`: if set to true, UDP responses will not be sent for queries received on this bind. Default to false
     * member `toString()`: print the address this bind listens to
  * Network related:
     * `addLocal(netmask, [true], [false], [TCP Fast Open queue size])`: add to addresses we listen on. Second optional parameter sets TCP or not. Third optional parameter sets SO_REUSEPORT when available. Last parameter sets the TCP Fast Open queue size, enabling TCP Fast Open when available and the value is larger than 0.
@@ -1277,6 +1297,7 @@ Here are all functions:
     * `topSlow([top][, limit][, labels])`: show `top` queries slower than `limit` milliseconds, grouped by last `labels` labels
     * `topBandwidth(top)`: show top-`top` clients that consume the most bandwidth over length of ringbuffer
     * `topClients(n)`: show top-`n` clients sending the most queries over length of ringbuffer
+    * `setRingBuffersSize(n)`: set the capacity of the ringbuffers used for live traffic inspection to `n` (default to 10000)
     * `showResponseLatency()`: show a plot of the response time latency distribution
     * `showTCPStats()`: show some statistics regarding TCP
     * `showVersion()`: show the current version of dnsdist
@@ -1287,7 +1308,7 @@ Here are all functions:
     * `setVerboseHealthChecks(bool)`: set whether health check errors will be logged
  * Server related:
     * `newServer("ip:port")`: instantiate a new downstream server with default settings
-    * `newServer({address="ip:port", qps=1000, order=1, weight=10, pool="abuse", retries=5, tcpSendTimeout=30, tcpRecvTimeout=30, checkName="a.root-servers.net.", checkType="A", setCD=false, maxCheckFailures=1, mustResolve=false, useClientSubnet=true, source="address|interface name|address@interface"})`:
+    * `newServer({address="ip:port", qps=1000, order=1, weight=10, pool="abuse", retries=5, tcpConnectTimeout=5, tcpSendTimeout=30, tcpRecvTimeout=30, checkName="a.root-servers.net.", checkType="A", setCD=false, maxCheckFailures=1, mustResolve=false, useClientSubnet=true, source="address|interface name|address@interface"})`:
 instantiate a server with additional parameters
     * `showServers()`: output all servers
     * `getServer(n)`: returns server with index n 
@@ -1325,6 +1346,7 @@ instantiate a server with additional parameters
     * `QNameWireLengthRule(min, max)`: matches if the qname's length on the wire is less than `min` or more than `max` bytes
     * `QTypeRule(qtype)`: matches queries with the specified qtype
     * `RCodeRule(rcode)`: matches queries or responses the specified rcode
+    * `RDRule()`: matches queries with the `RD` flag set
     * `RegexRule(regex)`: matches the query name against the supplied regex
     * `RecordsCountRule(section, minCount, maxCount)`: matches if there is at least `minCount` and at most `maxCount` records in the `section` section
     * `RecordsTypeCountRule(section, type, minCount, maxCount)`: matches if there is at least `minCount` and at most `maxCount` records of type `type` in the `section` section
@@ -1335,16 +1357,21 @@ instantiate a server with additional parameters
  * Rule management related:
     * `clearRules()`: remove all current rules
     * `getAction(num)`: returns the Action associate with rule 'num'.
+    * `mvCacheHitResponseRule(from, to)`: move cache hit response rule 'from' to a position where it is in front of 'to'. 'to' can be one larger than the largest rule,
+     in which case the rule will be moved to the last position.
     * `mvResponseRule(from, to)`: move response rule 'from' to a position where it is in front of 'to'. 'to' can be one larger than the largest rule,
      in which case the rule will be moved to the last position.
     * `mvRule(from, to)`: move rule 'from' to a position where it is in front of 'to'. 'to' can be one larger than the largest rule,
      in which case the rule will be moved to the last position.
     * `newRuleAction(DNS Rule, DNS Action)`: return a pair of DNS Rule and DNS Action, to be used with `setRules()`
+    * `rmCacheHitResponseRule(n)`: remove cache hit response rule n
     * `rmResponseRule(n)`: remove response rule n
     * `rmRule(n)`: remove rule n
     * `setRules(list)`: replace the current rules with the supplied list of pairs of DNS Rules and DNS Actions (see `newRuleAction()`)
+    * `showCacheHitResponseRules()`: show all defined cache hit response rules
     * `showResponseRules()`: show all defined response rules
     * `showRules()`: show all defined rules
+    * `topCacheHitResponseRule()`: move the last cache hit response rule to the first position
     * `topResponseRule()`: move the last response rule to the first position
     * `topRule()`: move the last rule to the first position
  * Built-in Actions for Rules:
@@ -1366,7 +1393,7 @@ instantiate a server with additional parameters
     * `QPSAction(rule, maxqps)`: drop these packets if the QPS limits are exceeded
     * `RCodeAction(rcode)`: reply immediatly by turning the query into a response with the specified rcode
     * `RemoteLogAction(RemoteLogger [, alterFunction])`: send the content of this query to a remote logger via Protocol Buffer. `alterFunction` is a callback, receiving a DNSQuestion and a DNSDistProtoBufMessage, that can be used to modify the Protocol Buffer content, for example for anonymization purposes
-    * `RemoteLogResponseAction(RemoteLogger [,alterFunction])`: send the content of this response to a remote logger via Protocol Buffer. `alterFunction` is the same callback than the one in `RemoteLogAction`
+    * `RemoteLogResponseAction(RemoteLogger [,alterFunction [,includeCNAME]])`: send the content of this response to a remote logger via Protocol Buffer. `alterFunction` is the same callback than the one in `RemoteLogAction` and `includeCNAME` indicates whether CNAME records inside the response should be parsed and exported. The default is to only exports A and AAAA records
     * `SkipCacheAction()`: don't lookup the cache for this query, don't store the answer
     * `SpoofAction(ip[, ip])` or `SpoofAction({ip, ip, ..}): forge a response with the specified IPv4 (for an A query) or IPv6 (for an AAAA). If you specify multiple addresses, all that match the query type (A, AAAA or ANY) will get spoofed in
     * `SpoofCNAMEAction(cname)`: forge a response with the specified CNAME value
@@ -1394,8 +1421,11 @@ instantiate a server with additional parameters
  * Lua Action related:
     * `addLuaAction(x, func)`: where 'x' is all the combinations from `addPoolRule`, and func is a 
       function with the parameter `dq`, which returns an action to be taken on this packet.
+    * `addLuaResponseAction(x, func)`: where 'x' is all the combinations from `addPoolRule`, and func is a
+      function with the parameter `dr`, which returns an action to be taken on this response packet.
       Good for rare packets but where you want to do a lot of processing.
  * Server selection policy related:
+    * `setWHashedPertubation(value)`: set the hash perturbation value to be used in the `whashed` policy instead of a random one, allowing to have consistent `whashed` results on different instances
     * `setServerPolicy(policy)`: set server selection policy to that policy
     * `setServerPolicyLua(name, function)`: set server selection policy to one named 'name' and provided by 'function'
     * `showServerPolicy()`: show name of currently operational server selection policy
@@ -1418,7 +1448,7 @@ instantiate a server with additional parameters
     * `addDelay(netmask, n)`: delay answers within that netmask by n milliseconds
     * `addDelay({netmask, netmask}, n)`: delay answers within those netmasks (together) by n milliseconds
  * Answer changing functions:
-    * `truncateTC(bool)`: if set (default) truncate TC=1 answers so they are actually empty. Fixes an issue for PowerDNS Authoritative Server 2.9.22.
+    * `truncateTC(bool)`: if set (defaults to no starting with dnsdist 1.2.0) truncate TC=1 answers so they are actually empty. Fixes an issue for PowerDNS Authoritative Server 2.9.22. Note: turning this on breaks compatibility with RFC 6891.
     * `fixupCase(bool)`: if set (default to no), rewrite the first qname of the question part of the answer to match the one from the query. It is only useful when you have a downstream server that messes up the case of the question qname in the answer
  * Dynamic Block related:
     * `maintenance()`: called every second by dnsdist if defined, call functions below from it
@@ -1481,6 +1511,10 @@ instantiate a server with additional parameters
         * member `skipCache`: whether to skip cache lookup / storing the answer for this question (settable)
         * member `tcp`: whether this question was received over a TCP socket
         * member `useECS`: whether to send ECS to the backend (settable)
+    * DNSResponse gets the same member than DNSQuestion, plus some:
+        * member `editTTLs(func)`: the function `func` is invoked for every entries in the answer, authority
+        and additional section taking the section number (1 for answer, 2 for authority, 3 for additional),
+        the qclass and qtype values and the current TTL, and returning the new TTL or 0 to leave it unchanged
     * DNSHeader related
         * member `getRD()`: get recursion desired flag
         * member `setRD(bool)`: set recursion desired flag
@@ -1490,7 +1524,7 @@ instantiate a server with additional parameters
         * member `setCD(bool)`: set checking disabled flag
     * NetmaskGroup related
         * function `newNMG()`: returns a NetmaskGroup
-        * member `addMask(mask)`: adds `mask` to the NetmaskGroup
+        * member `addMask(mask)`: adds `mask` to the NetmaskGroup. Prefix with `!` to exclude this mask from matching.
         * member `match(ComboAddress)`: checks if ComboAddress is matched by this NetmaskGroup
         * member `clear()`: clears the NetmaskGroup
         * member `size()`: returns number of netmasks in this NetmaskGroup
@@ -1503,11 +1537,15 @@ instantiate a server with additional parameters
         * member `add(DNSName)`: add this DNSName to the node
  * Tuning related:
     * `setMaxTCPClientThreads(n)`: set the maximum of TCP client threads, handling TCP connections
+    * `setMaxTCPConnectionDuration(n)`: set the maximum duration of an incoming TCP connection, in seconds. 0 (the default) means unlimited
+    * `setMaxTCPConnectionsPerClient(n)`: set the maximum number of TCP connections per client. 0 (the default) means unlimited
+    * `setMaxTCPQueriesPerConnection(n)`: set the maximum number of queries in an incoming TCP connection. 0 (the default) means unlimited
     * `setMaxTCPQueuedConnections(n)`: set the maximum number of TCP connections queued (waiting to be picked up by a client thread), defaults to 1000. 0 means unlimited
     * `setMaxUDPOutstanding(n)`: set the maximum number of outstanding UDP queries to a given backend server. This can only be set at configuration time and defaults to 10240
     * `setCacheCleaningDelay(n)`: set the interval in seconds between two runs of the cache cleaning algorithm, removing expired entries
     * `setCacheCleaningPercentage(n)`: set the percentage of the cache that the cache cleaning algorithm will try to free by removing expired entries. By default (100), all expired entries are removed
     * `setStaleCacheEntriesTTL(n)`: allows using cache entries expired for at most `n` seconds when no backend available to answer for a query
+    * `setTCPUseSinglePipe(bool)`: whether the incoming TCP connections should be put into a single queue instead of using per-thread queues. Defaults to false
     * `setTCPRecvTimeout(n)`: set the read timeout on TCP connections from the client, in seconds
     * `setTCPSendTimeout(n)`: set the write timeout on TCP connections from the client, in seconds
     * `setUDPTimeout(n)`: set the maximum time dnsdist will wait for a response from a backend over UDP, in seconds. Defaults to 2

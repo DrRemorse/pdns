@@ -106,9 +106,15 @@ size_t readn2(int fd, void* buffer, size_t len)
   return len;
 }
 
-size_t readn2WithTimeout(int fd, void* buffer, size_t len, int timeout)
+size_t readn2WithTimeout(int fd, void* buffer, size_t len, int idleTimeout, int totalTimeout)
 {
   size_t pos = 0;
+  time_t start = 0;
+  int remainingTime = totalTimeout;
+  if (totalTimeout) {
+    start = time(NULL);
+  }
+
   do {
     ssize_t got = read(fd, (char *)buffer + pos, len - pos);
     if (got > 0) {
@@ -119,7 +125,7 @@ size_t readn2WithTimeout(int fd, void* buffer, size_t len, int timeout)
     }
     else {
       if (errno == EAGAIN) {
-        int res = waitForData(fd, timeout);
+        int res = waitForData(fd, (totalTimeout == 0 || idleTimeout <= remainingTime) ? idleTimeout : remainingTime);
         if (res > 0) {
           /* there is data available */
         }
@@ -132,6 +138,16 @@ size_t readn2WithTimeout(int fd, void* buffer, size_t len, int timeout)
       else {
         unixDie("failed in readn2WithTimeout");
       }
+    }
+
+    if (totalTimeout) {
+      time_t now = time(NULL);
+      int elapsed = now - start;
+      if (elapsed >= remainingTime) {
+        throw runtime_error("Timeout while reading data");
+      }
+      start = now;
+      remainingTime -= elapsed;
     }
   }
   while (pos < len);
@@ -694,7 +710,8 @@ int makeIPv6sockaddr(const std::string& addr, struct sockaddr_in6* ret)
   if(addr.empty())
     return -1;
   string ourAddr(addr);
-  int port = -1;
+  bool portSet = false;
+  unsigned int port;
   if(addr[0]=='[') { // [::]:53 style address
     string::size_type pos = addr.find(']');
     if(pos == string::npos || pos + 2 > addr.size() || addr[pos+1]!=':')
@@ -702,6 +719,7 @@ int makeIPv6sockaddr(const std::string& addr, struct sockaddr_in6* ret)
     ourAddr.assign(addr.c_str() + 1, pos-1);
     try {
       port = pdns_stou(addr.substr(pos+2));
+      portSet = true;
     }
     catch(std::out_of_range) {
       return -1;
@@ -728,12 +746,12 @@ int makeIPv6sockaddr(const std::string& addr, struct sockaddr_in6* ret)
     freeaddrinfo(res);
   }
 
-  if(port > 65535)
-    // negative ports are found with the pdns_stou above
-    return -1;
+  if(portSet) {
+    if(port > 65535)
+      return -1;
 
-  if(port >= 0)
     ret->sin6_port = htons(port);
+  }
 
   return 0;
 }

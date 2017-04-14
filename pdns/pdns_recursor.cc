@@ -111,8 +111,6 @@ __thread shared_ptr<Regex>* t_traceRegex;
 __thread boost::uuids::random_generator* t_uuidGenerator;
 #endif
 
-NetmaskGroup g_ednssubnets;
-SuffixMatchNode g_ednsdomains;
 
 RecursorControlChannel s_rcc; // only active in thread 0
 
@@ -1161,15 +1159,15 @@ void startDoResolve(void *p)
       iov[0].iov_base=(void*)buf;              iov[0].iov_len=2;
       iov[1].iov_base=(void*)&*packet.begin(); iov[1].iov_len = packet.size();
 
-      int ret=Utility::writev(dc->d_socket, iov, 2);
+      int wret=Utility::writev(dc->d_socket, iov, 2);
       bool hadError=true;
 
-      if(ret == 0)
+      if(wret == 0)
         L<<Logger::Error<<"EOF writing TCP answer to "<<dc->getRemote()<<endl;
-      else if(ret < 0 )
+      else if(wret < 0 )
         L<<Logger::Error<<"Error writing TCP answer to "<<dc->getRemote()<<": "<< strerror(errno) <<endl;
-      else if((unsigned int)ret != 2 + packet.size())
-        L<<Logger::Error<<"Oops, partial answer sent to "<<dc->getRemote()<<" for "<<dc->d_mdp.d_qname<<" (size="<< (2 + packet.size()) <<", sent "<<ret<<")"<<endl;
+      else if((unsigned int)wret != 2 + packet.size())
+        L<<Logger::Error<<"Oops, partial answer sent to "<<dc->getRemote()<<" for "<<dc->d_mdp.d_qname<<" (size="<< (2 + packet.size()) <<", sent "<<wret<<")"<<endl;
       else
         hadError=false;
 
@@ -1610,9 +1608,9 @@ string* doProcessUDPQuestion(const std::string& question, const ComboAddress& fr
         L<<Logger::Warning<<"Sending UDP reply to client "<<fromaddr.toStringWithPort()<<" failed with: "<<strerror(errno)<<endl;
 
       if(response.length() >= sizeof(struct dnsheader)) {
-        struct dnsheader dh;
-        memcpy(&dh, response.c_str(), sizeof(dh));
-        updateResponseStats(dh.rcode, fromaddr, response.length(), 0, 0);
+        struct dnsheader tmpdh;
+        memcpy(&tmpdh, response.c_str(), sizeof(tmpdh));
+        updateResponseStats(tmpdh.rcode, fromaddr, response.length(), 0, 0);
       }
       g_stats.avgLatencyUsec=(1-1.0/g_latencyStatSize)*g_stats.avgLatencyUsec + 0.0; // we assume 0 usec
       return 0;
@@ -1887,7 +1885,6 @@ void makeUDPServerSockets()
   
 #ifdef SO_REUSEPORT  
     if(::arg().mustDo("reuseport")) {
-      int one=1;
       if(setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0)
         throw PDNSException("SO_REUSEPORT: "+stringerror());
     }
@@ -2602,33 +2599,6 @@ void parseACLs()
   l_initialized = true;
 }
 
-boost::optional<Netmask> getEDNSSubnetMask(const ComboAddress& local, const DNSName&dn, const ComboAddress& rem)
-{
-  if(local.sin4.sin_family != AF_INET || local.sin4.sin_addr.s_addr) { // detect unset 'requestor'
-    if(g_ednsdomains.check(dn) || g_ednssubnets.match(rem)) {
-      int bits =local.sin4.sin_family == AF_INET ? 24 : 56;
-      ComboAddress trunc(local);
-      trunc.truncate(bits);
-      return boost::optional<Netmask>(Netmask(trunc, bits));
-    }
-  }
-  return boost::optional<Netmask>();
-}
-
-void  parseEDNSSubnetWhitelist(const std::string& wlist)
-{
-  vector<string> parts;
-  stringtok(parts, wlist, ",; ");
-  for(const auto& a : parts) {
-    try {
-      Netmask nm(a);
-      g_ednssubnets.addMask(nm);
-    }
-    catch(...) {
-      g_ednsdomains.add(DNSName(a));
-    }
-  }
-}
 
 std::unordered_set<DNSName> g_delegationOnly;
 static void setupDelegationOnly()
@@ -3109,6 +3079,8 @@ int main(int argc, char **argv)
     ::arg().set("lua-dns-script", "Filename containing an optional 'lua' script that will be used to modify dns answers")="";
     ::arg().set("latency-statistic-size","Number of latency values to calculate the qa-latency average")="10000";
     ::arg().setSwitch( "disable-packetcache", "Disable packetcache" )= "no";
+    ::arg().set("ecs-ipv4-bits", "Number of bits of IPv4 address to pass for EDNS Client Subnet")="24";
+    ::arg().set("ecs-ipv6-bits", "Number of bits of IPv6 address to pass for EDNS Client Subnet")="56";
     ::arg().set("edns-subnet-whitelist", "List of netmasks and domains that we should enable EDNS subnet for")="";
     ::arg().setSwitch( "pdns-distributes-queries", "If PowerDNS itself should distribute queries over threads")="";
     ::arg().setSwitch( "root-nx-trust", "If set, believe that an NXDOMAIN from the root means the TLD does not exist")="yes";

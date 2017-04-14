@@ -124,6 +124,7 @@ GlobalStateHolder<pools_t> g_pools;
 
 GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSAction> > > > g_rulactions;
 GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSResponseAction> > > > g_resprulactions;
+GlobalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std::shared_ptr<DNSResponseAction> > > > g_cachehitresprulactions;
 Rings g_rings;
 QueryCount g_qcount;
 
@@ -136,7 +137,7 @@ int g_tcpSendTimeout{2};
 int g_udpTimeout{2};
 
 bool g_servFailOnNoPolicy{false};
-bool g_truncateTC{1};
+bool g_truncateTC{false};
 bool g_fixupCase{0};
 static void truncateTC(const char* packet, uint16_t* len)
 try
@@ -442,16 +443,19 @@ try {
         ids->packetCache->insert(ids->cacheKey, ids->qname, ids->qtype, ids->qclass, response, responseLen, false, dh->rcode);
       }
 
+      if (ids->cs && !ids->cs->muted) {
 #ifdef HAVE_DNSCRYPT
-      if (!encryptResponse(response, &responseLen, responseSize, false, ids->dnsCryptQuery)) {
-        continue;
-      }
+        if (!encryptResponse(response, &responseLen, responseSize, false, ids->dnsCryptQuery)) {
+          continue;
+        }
 #endif
-      ComboAddress empty;
-      empty.sin4.sin_family = 0;
-      /* if ids->destHarvested is false, origDest holds the listening address.
-         We don't want to use that as a source since it could be 0.0.0.0 for example. */
-      sendUDPResponse(origFD, response, responseLen, ids->delayMsec, ids->destHarvested ? ids->origDest : empty, ids->origRemote);
+
+        ComboAddress empty;
+        empty.sin4.sin_family = 0;
+        /* if ids->destHarvested is false, origDest holds the listening address.
+           We don't want to use that as a source since it could be 0.0.0.0 for example. */
+        sendUDPResponse(origFD, response, responseLen, ids->delayMsec, ids->destHarvested ? ids->origDest : empty, ids->origRemote);
+      }
 
       g_stats.responses++;
 
@@ -509,15 +513,35 @@ catch(...)
   return 0;
 }
 
-DownstreamState::DownstreamState(const ComboAddress& remote_, const ComboAddress& sourceAddr_, unsigned int sourceItf_): remote(remote_), sourceAddr(sourceAddr_), sourceItf(sourceItf_)
+void DownstreamState::reconnect()
 {
+  connected = false;
+  if (fd != -1) {
+    /* shutdown() is needed to wake up recv() in the responderThread */
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+    fd = -1;
+  }
   if (!IsAnyAddress(remote)) {
     fd = SSocket(remote.sin4.sin_family, SOCK_DGRAM, 0);
     if (!IsAnyAddress(sourceAddr)) {
       SSetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1);
       SBind(fd, sourceAddr);
     }
-    SConnect(fd, remote);
+    try {
+      SConnect(fd, remote);
+      connected = true;
+    }
+    catch(const std::runtime_error& error) {
+      infolog("Error connecting to new server with address %s: %s", remote.toStringWithPort(), error.what());
+    }
+  }
+}
+
+DownstreamState::DownstreamState(const ComboAddress& remote_, const ComboAddress& sourceAddr_, unsigned int sourceItf_): remote(remote_), sourceAddr(sourceAddr_), sourceItf(sourceItf_)
+{
+  if (!IsAnyAddress(remote)) {
+    reconnect();
     idStates.resize(g_maxOutstanding);
     sw.start();
     infolog("Added downstream server %s", remote.toStringWithPort());
@@ -587,7 +611,7 @@ shared_ptr<DownstreamState> wrandom(const NumberedServerVector& servers, const D
   return valrandom(random(), servers, dq);
 }
 
-static uint32_t g_hashperturb;
+uint32_t g_hashperturb;
 shared_ptr<DownstreamState> whashed(const NumberedServerVector& servers, const DNSQuestion* dq)
 {
   return valrandom(dq->qname->hash(g_hashperturb), servers, dq);
@@ -937,16 +961,32 @@ bool processResponse(LocalStateHolder<vector<pair<std::shared_ptr<DNSRule>, std:
 
 static ssize_t udpClientSendRequestToBackend(DownstreamState* ss, const int sd, const char* request, const size_t requestLen)
 {
+  ssize_t result;
+
   if (ss->sourceItf == 0) {
-    return send(sd, request, requestLen, 0);
+    result = send(sd, request, requestLen, 0);
+  }
+  else {
+    struct msghdr msgh;
+    struct iovec iov;
+    char cbuf[256];
+    fillMSGHdr(&msgh, &iov, cbuf, sizeof(cbuf), const_cast<char*>(request), requestLen, &ss->remote);
+    addCMsgSrcAddr(&msgh, cbuf, &ss->sourceAddr, ss->sourceItf);
+    result = sendmsg(sd, &msgh, 0);
   }
 
-  struct msghdr msgh;
-  struct iovec iov;
-  char cbuf[256];
-  fillMSGHdr(&msgh, &iov, cbuf, sizeof(cbuf), const_cast<char*>(request), requestLen, &ss->remote);
-  addCMsgSrcAddr(&msgh, cbuf, &ss->sourceAddr, ss->sourceItf);
-  return sendmsg(sd, &msgh, 0);
+  if (result == -1) {
+    int savederrno = errno;
+    vinfolog("Error sending request to backend %s: %d", ss->remote.toStringWithPort(), savederrno);
+
+    /* This might sound silly, but on Linux send() might fail with EINVAL
+       if the interface the socket was bound to doesn't exist anymore. */
+    if (savederrno == EINVAL) {
+      ss->reconnect();
+    }
+  }
+
+  return result;
 }
 
 // listens to incoming queries, sends out to downstream servers, noting the intended return path 
@@ -972,6 +1012,7 @@ try
   auto acl = g_ACL.getLocal();
   auto localPolicy = g_policy.getLocal();
   auto localRulactions = g_rulactions.getLocal();
+  auto localCacheHitRespRulactions = g_cachehitresprulactions.getLocal();
   auto localServers = g_dstates.getLocal();
   auto localDynNMGBlock = g_dynblockNMG.getLocal();
   auto localDynSMTBlock = g_dynblockSMT.getLocal();
@@ -1066,8 +1107,13 @@ try
 
       string poolname;
       int delayMsec=0;
+      /* we need an accurate ("real") value for the response and
+         to store into the IDS, but not for insertion into the
+         rings for example */
+      struct timespec realTime;
       struct timespec now;
       gettime(&now);
+      gettime(&realTime, true);
 
       if (!processQuery(localDynNMGBlock, localDynSMTBlock, localRulactions, blockFilter, dq, poolname, &delayMsec, now))
       {
@@ -1081,12 +1127,15 @@ try
 
         restoreFlags(dh, origFlags);
 
+        if (!cs->muted) {
 #ifdef HAVE_DNSCRYPT
-        if (!encryptResponse(response, &responseLen, dq.size, false, dnsCryptQuery)) {
-          continue;
-        }
+          if (!encryptResponse(response, &responseLen, dq.size, false, dnsCryptQuery)) {
+            continue;
+          }
 #endif
-        sendUDPResponse(cs->udpFD, response, responseLen, 0, dest, remote);
+          sendUDPResponse(cs->udpFD, response, responseLen, 0, dest, remote);
+        }
+
         continue;
       }
 
@@ -1112,12 +1161,23 @@ try
         uint16_t cachedResponseSize = sizeof cachedResponse;
         uint32_t allowExpired = ss ? 0 : g_staleCacheEntriesTTL;
         if (packetCache->get(dq, consumed, dh->id, cachedResponse, &cachedResponseSize, &cacheKey, allowExpired)) {
-#ifdef HAVE_DNSCRYPT
-          if (!encryptResponse(cachedResponse, &cachedResponseSize, sizeof cachedResponse, false, dnsCryptQuery)) {
+          DNSResponse dr(dq.qname, dq.qtype, dq.qclass, dq.local, dq.remote, (dnsheader*) cachedResponse, sizeof cachedResponse, cachedResponseSize, false, &realTime);
+#ifdef HAVE_PROTOBUF
+          dr.uniqueId = dq.uniqueId;
+#endif
+          if (!processResponse(localCacheHitRespRulactions, dr, &delayMsec)) {
             continue;
           }
+
+          if (!cs->muted) {
+#ifdef HAVE_DNSCRYPT
+            if (!encryptResponse(cachedResponse, &cachedResponseSize, sizeof cachedResponse, false, dnsCryptQuery)) {
+              continue;
+            }
 #endif
-          sendUDPResponse(cs->udpFD, cachedResponse, cachedResponseSize, 0, dest, remote);
+            sendUDPResponse(cs->udpFD, cachedResponse, cachedResponseSize, 0, dest, remote);
+          }
+
           g_stats.cacheHits++;
           g_stats.latency0_1++;  // we're not going to measure this
           doLatencyAverages(0);  // same
@@ -1160,10 +1220,11 @@ try
         g_stats.downstreamTimeouts++;
       }
 
+      ids->cs = cs;
       ids->origFD = cs->udpFD;
       ids->origID = dh->id;
       ids->origRemote = remote;
-      ids->sentTime.start();
+      ids->sentTime.set(realTime);
       ids->qname = qname;
       ids->qtype = dq.qtype;
       ids->qclass = dq.qclass;
@@ -1407,6 +1468,20 @@ void* healthChecksThread()
 
         if(newState != dss->upStatus) {
           warnlog("Marking downstream %s as '%s'", dss->getNameWithAddr(), newState ? "up" : "down");
+
+          if (newState && !dss->connected) {
+            try {
+              SConnect(dss->fd, dss->remote);
+              dss->connected = true;
+              dss->tid = move(thread(responderThread, dss));
+            }
+            catch(const std::runtime_error& error) {
+              infolog("Error connecting to new server with address %s: %s", dss->remote.toStringWithPort(), error.what());
+              newState = false;
+              dss->connected = false;
+            }
+          }
+
           dss->upStatus = newState;
           dss->currentCheckFailures = 0;
         }
@@ -1730,7 +1805,11 @@ try
       g_verbose=true;
       break;
     case 'V':
-      cout<<"dnsdist "<<VERSION<<" ("<<LUA_VERSION<<")"<<endl;
+#ifdef LUAJIT_VERSION
+      cout<<"dnsdist "<<VERSION<<" ("<<LUA_RELEASE<<" ["<<LUAJIT_VERSION<<"])"<<endl;
+#else
+      cout<<"dnsdist "<<VERSION<<" ("<<LUA_RELEASE<<")"<<endl;
+#endif
       cout<<"Enabled features: ";
 #ifdef HAVE_DNSCRYPT
       cout<<"dnscrypt ";
@@ -2006,7 +2085,7 @@ try
   /* this need to be done _after_ dropping privileges */
   g_delay = new DelayPipe<DelayedPacket>();
 
-  g_tcpclientthreads = std::make_shared<TCPClientCollection>(g_maxTCPClientThreads);
+  g_tcpclientthreads = std::make_shared<TCPClientCollection>(g_maxTCPClientThreads, g_useTCPSinglePipe);
 
   for(auto& t : todo)
     t();
@@ -2018,7 +2097,9 @@ try
     for(const auto& address : g_cmdLine.remotes) {
       auto ret=std::make_shared<DownstreamState>(ComboAddress(address, 53));
       addServerToPool(localPools, "", ret);
-      ret->tid = move(thread(responderThread, ret));
+      if (ret->connected) {
+        ret->tid = move(thread(responderThread, ret));
+      }
       g_dstates.modify([ret](servers_t& servers) { servers.push_back(ret); });
     }
   }
